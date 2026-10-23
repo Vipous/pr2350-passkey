@@ -4,20 +4,24 @@
 #include "tusb.h"
 
 #define USB_VID 0xCafe   // TinyUSB test VID, fine for a personal device
-#define USB_PID 0x4A20
+#define USB_PID 0x4A21   // HID + CDC; differs from the keyboard-only build so hosts re-enumerate
 
-enum { ITF_NUM_HID = 0, ITF_NUM_TOTAL };
+enum { ITF_NUM_HID = 0, ITF_NUM_CDC, ITF_NUM_CDC_DATA, ITF_NUM_TOTAL };
 
-#define EPNUM_HID 0x81
-#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
+#define EPNUM_HID       0x81
+#define EPNUM_CDC_NOTIF 0x82
+#define EPNUM_CDC_OUT   0x03
+#define EPNUM_CDC_IN    0x83
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_CDC_DESC_LEN)
 
 static const tusb_desc_device_t desc_device = {
     .bLength = sizeof(tusb_desc_device_t),
     .bDescriptorType = TUSB_DESC_DEVICE,
     .bcdUSB = 0x0200,
-    .bDeviceClass = 0x00,   // class is given per interface
-    .bDeviceSubClass = 0x00,
-    .bDeviceProtocol = 0x00,
+    // CDC uses an IAD, so the device class is "miscellaneous / common class".
+    .bDeviceClass = TUSB_CLASS_MISC,
+    .bDeviceSubClass = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol = MISC_PROTOCOL_IAD,
     .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor = USB_VID,
     .idProduct = USB_PID,
@@ -37,6 +41,8 @@ static const uint8_t desc_configuration[] = {
     // Boot protocol keyboard, so it also works in BIOS/UEFI and FileVault prompts.
     TUD_HID_DESCRIPTOR(ITF_NUM_HID, 4, HID_ITF_PROTOCOL_KEYBOARD, sizeof(desc_hid_report),
                        EPNUM_HID, CFG_TUD_HID_EP_BUFSIZE, 1),
+    // Serial port that the editor page talks to.
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 5, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
 };
 
 static const char *const string_desc[] = {
@@ -45,6 +51,7 @@ static const char *const string_desc[] = {
     "Pass Key Keyboard",  // 2: product
     NULL,                 // 3: serial, from the flash unique id
     "Pass Key",           // 4: HID interface
+    "Pass Key Editor",    // 5: CDC interface
 };
 
 const uint8_t *tud_descriptor_device_cb(void) {

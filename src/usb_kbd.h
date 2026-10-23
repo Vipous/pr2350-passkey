@@ -4,9 +4,8 @@
 
 // USB HID keyboard that types ASCII strings ('\t' = Tab, '\n' = Enter).
 //
-// usb_kbd_init() and usb_kbd_task() run on core 0, the rest is safe to call from core 1.
+// usb_kbd_task() runs on core 0 after tud_task(), the rest is safe to call from core 1.
 
-void usb_kbd_init(void);
 void usb_kbd_task(void);
 
 // Queues text for typing. Returns false if the host isn't connected or typing is in progress.

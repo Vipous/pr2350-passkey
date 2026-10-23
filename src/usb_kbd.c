@@ -25,10 +25,6 @@ static size_t pos;
 static bool key_down;
 static absolute_time_t next_report;
 
-void usb_kbd_init(void) {
-    tusb_init();
-}
-
 bool usb_kbd_type(const char *s) {
     if (pending || !mounted) return false;
     size_t n = strlen(s);
@@ -95,7 +91,6 @@ static void type_step(void) {
 }
 
 void usb_kbd_task(void) {
-    tud_task();
     mounted = tud_mounted();
     type_step();
 }

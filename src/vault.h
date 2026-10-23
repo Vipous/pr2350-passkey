@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Password storage: an encrypted, PIN-protected list kept in the last 36 KB of flash.
+// Password storage: a list kept in the last 32 KB of flash, unencrypted.
 // Firmware updates via UF2 don't touch that area, so entries survive reflashing.
 //
 // Call from one core only (the UI core); writes lock out the other core while flash is busy.
@@ -12,12 +12,6 @@
 #define VAULT_LOGIN_LEN   63
 #define VAULT_PASS_LEN    64
 #define VAULT_MAX_ENTRIES 96
-
-#define VAULT_PIN_MIN 4
-#define VAULT_PIN_MAX 12
-
-// Wrong PINs in a row before everything is erased; 0 disables wiping.
-#define VAULT_MAX_ATTEMPTS 10
 
 #define VAULT_FLAG_ENTER 0x01   // press Enter after typing
 #define VAULT_FLAG_LOGIN 0x02   // type login and Tab before the password
@@ -29,17 +23,7 @@ typedef struct {
     uint8_t flags;
 } vault_entry_t;
 
-typedef enum { UNLOCK_OK, UNLOCK_WRONG_PIN, UNLOCK_WIPED } unlock_result_t;
-
-bool vault_exists(void);   // false before the first PIN is set
-bool vault_is_unlocked(void);
-int vault_attempts_left(void);
-
-bool vault_create(const char *pin);
-unlock_result_t vault_unlock(const char *pin);   // slow on purpose: about a second of key derivation
-void vault_lock(void);
-bool vault_change_pin(const char *new_pin);
-void vault_wipe(void);
+void vault_init(void);   // loads the newest valid copy from flash
 
 int vault_count(void);
 const vault_entry_t *vault_get(int index);
@@ -47,3 +31,4 @@ const vault_entry_t *vault_get(int index);
 // returns the entry's new index, or -1 if it could not be saved.
 int vault_put(int index, const vault_entry_t *entry);
 bool vault_delete(int index);
+bool vault_wipe(void);

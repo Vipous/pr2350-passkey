@@ -42,7 +42,7 @@ add_executable(pass_key
     src/main.c
     src/usb_kbd.c
     src/usb_descriptors.c
-    src/crypto.c
+    src/editor.c
     src/vault.c
     src/ui.c
 )
