@@ -7,17 +7,18 @@
 
 #include "backup.h"
 #include "hardware/sync.h"
+#include "hotkeys.h"
 #include "tusb.h"
 #include "vault.h"
 
-#define PROTOCOL_VERSION 3
+#define PROTOCOL_VERSION 4
 #define LINE_MAX 320
 #define MAX_FIELDS 6
 
 // ---------------------------------------------------------------------------
 // Mailbox between the cores: core 0 posts, core 1 runs it against the vault and marks it done.
 
-typedef enum { OP_GET, OP_PUT, OP_DEL, OP_WIPE, OP_BACKUP, OP_RESTORE } op_t;
+typedef enum { OP_GET, OP_PUT, OP_DEL, OP_WIPE, OP_BACKUP, OP_RESTORE, OP_KEYS_GET, OP_KEYS_SET, OP_KEYS_RESET } op_t;
 enum { REQ_IDLE, REQ_POSTED, REQ_DONE };
 
 static struct {
@@ -46,6 +47,12 @@ static volatile uint8_t lock_mode;
 // during BACKUP; core 1 only touches it inside a request or while a restore waits for the code.
 static uint8_t xfer[BACKUP_MAX_SIZE];
 static size_t xfer_len, xfer_expected;
+
+// Hotkey panel being read or written: core 0 fills it between KEYS_BEGIN and KEYS_END,
+// core 1 copies it in or out inside a request.
+static hotkey_t keys_buf[HOTKEYS_MAX];
+static int keys_n, keys_expected;
+static bool keys_receiving;
 
 typedef enum { RS_IDLE, RS_RECEIVING, RS_WAITING, RS_DONE, RS_CANCELLED, RS_FAILED } restore_state_t;
 static volatile restore_state_t restore_state;
@@ -82,8 +89,10 @@ editor_activity_t editor_service(void) {
     __dmb();
     bool changed = false;
     const vault_entry_t *e;
-    // Wiping works while locked: it's the way out of a forgotten PIN.
-    if (!vault_is_unlocked() && req.op != OP_WIPE) {
+    // Wiping works while locked: it's the way out of a forgotten PIN. The hotkeys aren't
+    // secret and aren't in the vault, so they can be edited too.
+    bool any_lock = req.op == OP_WIPE || req.op == OP_KEYS_GET || req.op == OP_KEYS_SET || req.op == OP_KEYS_RESET;
+    if (!vault_is_unlocked() && !any_lock) {
         req.result = -3;
         req.count = 0;
         __dmb();
@@ -136,6 +145,19 @@ editor_activity_t editor_service(void) {
         restore_replace = req.replace;
         __dmb();
         restore_state = RS_WAITING;   // the UI now asks for the recovery code
+        break;
+    case OP_KEYS_GET:
+        keys_n = hotkeys_count();
+        for (int i = 0; i < keys_n; i++) keys_buf[i] = *hotkeys_get(i);
+        req.result = keys_n;
+        break;
+    case OP_KEYS_SET:
+        req.result = hotkeys_set(keys_buf, keys_n) ? 1 : -1;
+        changed = true;
+        break;
+    case OP_KEYS_RESET:
+        req.result = hotkeys_reset() ? 1 : -1;
+        changed = true;
         break;
     }
     req.count = vault_count();
@@ -328,6 +350,47 @@ static void handle_line(char *s) {
             waiting_op = OP_RESTORE;
             post(OP_RESTORE, 0);
         }
+    } else if (strcmp(cmd, "KEYS") == 0) {
+        waiting_op = OP_KEYS_GET;
+        post(OP_KEYS_GET, 0);
+    } else if (strcmp(cmd, "KEYS_BEGIN") == 0) {
+        long k = n > 1 ? strtol(f[1], NULL, 10) : -1;
+        if (k < 0 || k > HOTKEYS_MAX) err = "too many hotkeys";
+        else {
+            keys_expected = (int)k;
+            keys_n = 0;
+            keys_receiving = true;
+            reply("OK\n");
+            return;
+        }
+    } else if (strcmp(cmd, "KEY") == 0) {
+        // KEY <label> <combo|media> <modifiers> <code>
+        long type = n > 2 ? strtol(f[2], NULL, 10) : -1, mods = n > 3 ? strtol(f[3], NULL, 10) : -1;
+        long code = n > 4 ? strtol(f[4], NULL, 10) : -1;
+        if (!keys_receiving || keys_n >= keys_expected) err = "unexpected KEY";
+        else if (n < 5 || !f[1][0] || strlen(f[1]) >= HOTKEY_LABEL_LEN || !printable(f[1])) err = "bad label";
+        else if (type < HOTKEY_COMBO || type > HOTKEY_MEDIA || mods < 0 || mods > 0xFF || code <= 0 || code > 0xFFFF)
+            err = "bad key";
+        else {
+            hotkey_t *k = &keys_buf[keys_n++];
+            memset(k, 0, sizeof(*k));
+            strcpy(k->label, f[1]);
+            k->type = (uint8_t)type;
+            k->mods = (uint8_t)mods;
+            k->code = (uint16_t)code;
+            reply("OK\n");
+            return;
+        }
+    } else if (strcmp(cmd, "KEYS_END") == 0) {
+        if (!keys_receiving || keys_n != keys_expected) err = "incomplete hotkey list";
+        else {
+            keys_receiving = false;
+            waiting_op = OP_KEYS_SET;
+            post(OP_KEYS_SET, 0);
+        }
+    } else if (strcmp(cmd, "KEYS_RESET") == 0) {
+        waiting_op = OP_KEYS_RESET;
+        post(OP_KEYS_RESET, 0);
     } else if (strcmp(cmd, "RESTORE_STATUS") == 0) {
         switch (restore_state) {
         case RS_WAITING: reply("OK waiting\n"); break;
@@ -356,6 +419,14 @@ void editor_task(void) {
             backup_pos = 0;
             state = ST_BACKUP;
             req.state = REQ_IDLE;
+            return;
+        }
+        if (state == ST_WAIT && waiting_op == OP_KEYS_GET) {
+            for (int i = 0; i < keys_n; i++)
+                reply("K\t%s\t%d\t%d\t%d\n", keys_buf[i].label, keys_buf[i].type, keys_buf[i].mods, keys_buf[i].code);
+            reply("OK %d\n", keys_n);
+            req.state = REQ_IDLE;
+            state = ST_READ;
             return;
         }
         if (state == ST_WAIT) {

@@ -39,6 +39,8 @@
     background: var(--input); color: var(--text); min-width: 0; }
   input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
   input.bad { outline: 2px solid var(--danger); outline-offset: -1px; }
+  select { font: inherit; padding: 7px 8px; border: 1px solid var(--line); border-radius: 9px;
+           background: var(--input); color: var(--text); max-width: 100%; }
   label.check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); white-space: nowrap; }
   .grid { display: grid; grid-template-columns: 1.1fr 1.1fr 1.4fr; gap: 10px; }
   .field > span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
@@ -166,6 +168,27 @@
     </div>
 
     </div>
+    <div class="card hidden" id="keysCard">
+      <h2>Панель горячих клавиш</h2>
+      <p class="note" style="margin-top:0">Четыре большие плитки режима <b>Hotkeys</b> на плате (2 × 2). Каждая нажимает
+        сочетание клавиш или медиаклавишу. Порядок: первая — слева вверху, вторая — справа вверху, третья и
+        четвёртая — внизу. Панель не секретна, её можно менять
+        и на заблокированной плате.</p>
+      <table>
+        <thead><tr><th style="width:28%">Название</th><th style="width:26%">Клавиша</th><th>Вместе с</th><th></th></tr></thead>
+        <tbody id="keyRows"></tbody>
+      </table>
+      <div class="row-actions">
+        <button id="keyAdd">Добавить плитку</button>
+        <select id="keyPreset" class="select">
+          <option value="mac">Набор для Mac</option>
+          <option value="win">Набор для Windows</option>
+        </select>
+        <button id="keyPresetBtn">Подставить набор</button>
+        <span class="spacer"></span>
+        <button class="primary" id="keySave" disabled>Сохранить на плату</button>
+      </div>
+    </div>
     <div class="card">
       <h2>Опасная зона</h2>
       <div class="row-actions" style="margin-top:0">
@@ -185,7 +208,8 @@
 <script>
 'use strict';
 
-const VID = 0xCAFE, PID = 0x4A21;
+// The PID changes whenever the board's USB interfaces do; keep every firmware with the editor port here.
+const VID = 0xCAFE, PIDS = [0x4A21, 0x4A22];
 const LIMITS = { name: 31, login: 62, pass: 63 };
 const FLAG_ENTER = 1, FLAG_LOGIN = 2;
 
@@ -269,6 +293,7 @@ async function connect(port) {
     await dev.open(port);
     setConnected(true);
     await refresh();
+    await loadKeys();
   } catch (e) {
     toast('Не удалось подключиться: ' + e.message, true);
     await dev.close();
@@ -550,6 +575,135 @@ $('addBtn').onclick = () => busy($('addBtn'), async () => {
   await refresh();
 });
 
+// ---------------------------------------------------------------- hotkeys
+
+const MOD_CTRL = 1, MOD_SHIFT = 2, MOD_ALT = 4, MOD_GUI = 8;
+const HOTKEYS_MAX = 4;   // one screen on the board, 2 x 2
+
+// HID keyboard usages (type 0) and consumer usages (type 1) offered in the key menu.
+const KEY_OPTIONS = (() => {
+  const k = [];
+  for (let i = 0; i < 26; i++) k.push([4 + i, String.fromCharCode(65 + i)]);
+  for (let i = 1; i <= 9; i++) k.push([0x1D + i, String(i)]);
+  k.push([0x27, '0']);
+  for (let i = 1; i <= 12; i++) k.push([0x39 + i, 'F' + i]);
+  for (let i = 13; i <= 19; i++) k.push([0x68 + i - 13, 'F' + i]);
+  k.push([0x2C, 'Пробел'], [0x28, 'Enter'], [0x29, 'Esc'], [0x2B, 'Tab'], [0x2A, 'Backspace'], [0x4C, 'Delete'],
+         [0x52, '↑'], [0x51, '↓'], [0x50, '←'], [0x4F, '→'], [0x4A, 'Home'], [0x4D, 'End'], [0x4B, 'PgUp'], [0x4E, 'PgDn'],
+         [0x2D, '-'], [0x2E, '='], [0x2F, '['], [0x30, ']'], [0x31, '\\'], [0x33, ';'], [0x34, "'"], [0x35, '`'],
+         [0x36, ','], [0x37, '.'], [0x38, '/']);
+  return k;
+})();
+const MEDIA_OPTIONS = [[0xCD, 'Пауза / воспроизведение'], [0xB5, 'Следующий трек'], [0xB6, 'Предыдущий трек'],
+                       [0xE2, 'Выключить звук'], [0xE9, 'Громче'], [0xEA, 'Тише'], [0x6F, 'Ярче экран'], [0x70, 'Темнее экран']];
+
+const KEY_PRESETS = {
+  mac: [
+    { label: 'Lock screen', type: 0, mods: MOD_CTRL | MOD_GUI, code: 0x14 },
+    { label: 'Screenshot', type: 0, mods: MOD_GUI | MOD_SHIFT, code: 0x21 },
+    { label: 'Mute Zoom', type: 0, mods: MOD_GUI | MOD_SHIFT, code: 0x04 },
+    { label: 'Play / Pause', type: 1, mods: 0, code: 0xCD },
+  ],
+  win: [
+    { label: 'Lock screen', type: 0, mods: MOD_GUI, code: 0x0F },                 // Win+L
+    { label: 'Screenshot', type: 0, mods: MOD_GUI | MOD_SHIFT, code: 0x16 },      // Win+Shift+S
+    { label: 'Mute Teams', type: 0, mods: MOD_CTRL | MOD_SHIFT, code: 0x10 },     // Ctrl+Shift+M
+    { label: 'Play / Pause', type: 1, mods: 0, code: 0xCD },
+  ],
+};
+
+let hotkeys = [];
+let keysChanged = false;   // edits not yet on the board
+
+function keysDirty(dirty = true) { keysChanged = dirty; $('keySave').disabled = !dirty; }
+
+async function loadKeys() {
+  try {
+    const r = await dev.cmd(['KEYS']);
+    hotkeys = r.data.filter(l => l.startsWith('K\t')).map(l => {
+      const f = l.split('\t');
+      return { label: f[1], type: +f[2], mods: +f[3], code: +f[4] };
+    });
+    $('keysCard').classList.remove('hidden');
+    renderKeys();
+    keysDirty(false);
+  } catch (e) {
+    $('keysCard').classList.add('hidden');   // older firmware without a panel
+  }
+}
+
+function keySelect(k) {
+  const sel = el('select');
+  const group = (title, items, type) => {
+    const g = el('optgroup', { label: title });
+    for (const [code, name] of items) g.append(el('option', { value: `${type}:${code}`, textContent: name }));
+    sel.append(g);
+  };
+  group('Клавиши', KEY_OPTIONS, 0);
+  group('Медиа', MEDIA_OPTIONS, 1);
+  sel.value = `${k.type}:${k.code}`;
+  if (sel.value !== `${k.type}:${k.code}`) {   // a code the menu doesn't list: keep it
+    sel.append(el('option', { value: `${k.type}:${k.code}`, textContent: `код 0x${k.code.toString(16)}` }));
+    sel.value = `${k.type}:${k.code}`;
+  }
+  return sel;
+}
+
+function renderKeys() {
+  const tbody = $('keyRows');
+  tbody.textContent = '';
+  hotkeys.forEach((k, i) => {
+    const label = el('input', { type: 'text', value: k.label, maxLength: 19 });
+    label.oninput = () => { k.label = label.value; keysDirty(); };
+    const sel = keySelect(k);
+    const mods = [[MOD_CTRL, '⌃ Ctrl'], [MOD_ALT, '⌥ Opt/Alt'], [MOD_SHIFT, '⇧ Shift'], [MOD_GUI, '⌘ Cmd/Win']].map(([bit, name]) => {
+      const box = el('input', { type: 'checkbox', checked: !!(k.mods & bit), disabled: k.type === 1 });
+      box.onchange = () => { k.mods = box.checked ? k.mods | bit : k.mods & ~bit; keysDirty(); };
+      return el('label', { className: 'check' }, [box, name]);
+    });
+    sel.onchange = () => {
+      const [type, code] = sel.value.split(':').map(Number);
+      k.type = type; k.code = code;
+      if (type === 1) k.mods = 0;
+      renderKeys(); keysDirty();
+    };
+    const move = (d) => { const j = i + d; [hotkeys[i], hotkeys[j]] = [hotkeys[j], hotkeys[i]]; renderKeys(); keysDirty(); };
+    const up = el('button', { className: 'icon', textContent: '↑', title: 'Выше', disabled: i === 0, onclick: () => move(-1) });
+    const down = el('button', { className: 'icon', textContent: '↓', title: 'Ниже', disabled: i === hotkeys.length - 1, onclick: () => move(1) });
+    const del = el('button', { className: 'icon danger', textContent: '✕', title: 'Удалить',
+                               onclick: () => { hotkeys.splice(i, 1); renderKeys(); keysDirty(); } });
+    tbody.append(el('tr', {}, [
+      el('td', {}, [label]), el('td', {}, [sel]),
+      el('td', { className: 'flags' }, mods),
+      el('td', { className: 'act' }, [up, ' ', down, ' ', del]),
+    ]));
+  });
+  $('keyAdd').disabled = hotkeys.length >= HOTKEYS_MAX;
+}
+
+$('keyAdd').onclick = () => {
+  hotkeys.push({ label: 'New key', type: 0, mods: MOD_GUI, code: 0x04 });
+  renderKeys(); keysDirty();
+};
+
+$('keyPresetBtn').onclick = () => {
+  if (hotkeys.length && !confirm('Заменить плитки выбранным набором? Сохраните, чтобы отправить на плату.')) return;
+  hotkeys = KEY_PRESETS[$('keyPreset').value].map(k => ({ ...k }));
+  renderKeys(); keysDirty();
+};
+
+$('keySave').onclick = () => busy($('keySave'), async () => {
+  for (const k of hotkeys) {
+    const err = (k.label.trim() ? null : 'У плитки нет названия') || check(k.label, 19, 'Название плитки');
+    if (err) return toast(err, true);
+  }
+  await dev.cmd(['KEYS_BEGIN', hotkeys.length]);
+  for (const k of hotkeys) await dev.cmd(['KEY', k.label.trim(), k.type, k.mods, k.code]);
+  await dev.cmd(['KEYS_END']);
+  toast('Панель сохранена');
+  await loadKeys();
+}).then(() => keysDirty(keysChanged));   // busy() re-enables the button; keep it off when saved
+
 // ---------------------------------------------------------------- backup
 
 const BACKUP_CHUNK = 96;   // bytes per R line, as the board sends them
@@ -632,7 +786,7 @@ if (!('serial' in navigator)) {
 } else {
   $('connectBtn').onclick = async () => {
     let port;
-    try { port = await navigator.serial.requestPort({ filters: [{ usbVendorId: VID, usbProductId: PID }] }); }
+    try { port = await navigator.serial.requestPort({ filters: PIDS.map(pid => ({ usbVendorId: VID, usbProductId: pid })) }); }
     catch (e) { return; }   // user closed the picker
     await connect(port);
   };
@@ -643,7 +797,7 @@ if (!('serial' in navigator)) {
     if (dev.port) return;
     const ports = (await navigator.serial.getPorts()).filter(p => {
       const i = p.getInfo();
-      return i.usbVendorId === VID && i.usbProductId === PID;
+      return i.usbVendorId === VID && PIDS.includes(i.usbProductId);
     });
     if (ports.length) await connect(ports[0]);
   };

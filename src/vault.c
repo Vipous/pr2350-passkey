@@ -5,8 +5,8 @@
 #include <strings.h>
 
 #include "crypto.h"
+#include "flash_store.h"
 #include "hardware/flash.h"
-#include "pico/flash.h"
 #include "pico/rand.h"
 
 // Flash layout, at the end of the chip:
@@ -15,7 +15,7 @@
 // mid-write leaves the previous copy intact.
 #define SLOT_SIZE      (16 * 1024)
 #define REGION_SIZE    (FLASH_SECTOR_SIZE + 2 * SLOT_SIZE)
-#define REGION_OFFSET  (PICO_FLASH_SIZE_BYTES - REGION_SIZE)
+#define REGION_OFFSET  VAULT_FLASH_OFFSET
 #define COUNTER_OFFSET REGION_OFFSET
 #define SLOT_OFFSET(i) (REGION_OFFSET + FLASH_SECTOR_SIZE + (i) * SLOT_SIZE)
 
@@ -48,6 +48,7 @@ typedef struct {
     uint32_t crc;
 } header_v2_t;
 
+_Static_assert(REGION_SIZE == VAULT_FLASH_SIZE, "layout in flash_store.h");
 _Static_assert(sizeof(vault_entry_t) == 160, "entry layout is stored in flash");
 _Static_assert(sizeof(header_t) + VAULT_MAX_ENTRIES * sizeof(vault_entry_t) + RECOVERY_BLOCK <= SLOT_SIZE,
                "slot too small");
@@ -68,29 +69,7 @@ static int current_slot = -1;
 static uint8_t image[SLOT_SIZE];   // staging buffer for one slot, wiped after use
 
 // ---------------------------------------------------------------------------
-// Flash access
-
-static const uint8_t *flash_ptr(uint32_t offset) {
-    return (const uint8_t *)(XIP_BASE + offset);
-}
-
-typedef struct {
-    uint32_t offset;
-    const uint8_t *data;   // NULL: erase only
-    uint32_t len;
-    bool erase;
-} flash_op_t;
-
-static void flash_op_cb(void *param) {
-    const flash_op_t *op = param;
-    if (op->erase) flash_range_erase(op->offset, op->len);
-    if (op->data) flash_range_program(op->offset, op->data, op->len);
-}
-
-static bool flash_run(uint32_t offset, const uint8_t *data, uint32_t len, bool erase) {
-    flash_op_t op = {offset, data, len, erase};
-    return flash_safe_execute(flash_op_cb, &op, 1000) == PICO_OK;
-}
+// Wrong-PIN counter
 
 // Wrong-secret counter: one zero byte per attempt in the first page of its sector. NOR flash
 // can clear more bits in an already programmed page, so counting up needs no erase.
@@ -112,16 +91,6 @@ static void fail_count_add(void) {
 
 static void fail_count_reset(void) {
     if (fail_count() > 0) flash_run(COUNTER_OFFSET, NULL, FLASH_SECTOR_SIZE, true);
-}
-
-static uint32_t crc32(const void *data, size_t n) {
-    const uint8_t *p = data;
-    uint32_t crc = 0xFFFFFFFFu;
-    while (n--) {
-        crc ^= *p++;
-        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & -(crc & 1));
-    }
-    return ~crc;
 }
 
 // ---------------------------------------------------------------------------

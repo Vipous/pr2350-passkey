@@ -43,9 +43,12 @@ add_executable(pass_key
     src/usb_kbd.c
     src/usb_descriptors.c
     src/editor.c
+    src/flash_store.c
     src/crypto.c
     src/vault.c
     src/backup.c
+    src/hotkeys.c
+    src/buttons.c
     src/ui.c
 )
 target_include_directories(pass_key PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)

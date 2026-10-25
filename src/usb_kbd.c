@@ -15,8 +15,16 @@
 
 static const uint8_t ascii_to_key[128][2] = {HID_ASCII_TO_KEYCODE};
 
-// Core 1 fills `text` and then raises `pending`; core 0 types it, wipes it and clears `pending`.
+#define ITF_KEYBOARD 0   // HID instances, in descriptor order
+#define ITF_MEDIA    1
+
+// Core 1 fills in the action and then raises `pending`; core 0 sends it, wipes the text and
+// clears `pending`.
+typedef enum { ACT_TEXT, ACT_COMBO, ACT_MEDIA } action_t;
+static action_t action;
 static char text[TEXT_MAX];
+static uint8_t combo_mods, combo_key;
+static uint16_t media_usage;
 static volatile bool pending;
 static volatile bool mounted;
 static volatile uint8_t host_leds;   // Caps Lock etc., reported by the host
@@ -29,8 +37,28 @@ bool usb_kbd_type(const char *s) {
     if (pending || !mounted) return false;
     size_t n = strlen(s);
     if (n >= TEXT_MAX) n = TEXT_MAX - 1;
+    action = ACT_TEXT;
     memcpy(text, s, n);
     text[n] = 0;
+    __dmb();
+    pending = true;
+    return true;
+}
+
+bool usb_kbd_combo(uint8_t modifiers, uint8_t keycode) {
+    if (pending || !mounted) return false;
+    action = ACT_COMBO;
+    combo_mods = modifiers;
+    combo_key = keycode;
+    __dmb();
+    pending = true;
+    return true;
+}
+
+bool usb_kbd_media(uint16_t usage) {
+    if (pending || !mounted) return false;
+    action = ACT_MEDIA;
+    media_usage = usage;
     __dmb();
     pending = true;
     return true;
@@ -52,6 +80,25 @@ static void finish(void) {
     pending = false;
 }
 
+// One key combination or media key: press, then release on the next step.
+static void press_step(void) {
+    if (action == ACT_MEDIA) {
+        if (!tud_hid_n_ready(ITF_MEDIA)) return;
+        uint16_t usage = key_down ? 0 : media_usage;
+        tud_hid_n_report(ITF_MEDIA, 0, &usage, sizeof(usage));
+    } else {
+        if (!tud_hid_n_ready(ITF_KEYBOARD)) return;
+        uint8_t keycode[6] = {key_down ? 0 : combo_key};
+        tud_hid_n_keyboard_report(ITF_KEYBOARD, 0, key_down ? 0 : combo_mods, keycode);
+    }
+    if (key_down) {
+        finish();
+        return;
+    }
+    key_down = true;
+    next_report = make_timeout_time_us(KEY_DELAY_US);
+}
+
 static void type_step(void) {
     if (!pending) return;
 
@@ -60,7 +107,12 @@ static void type_step(void) {
         finish();
         return;
     }
-    if (!time_reached(next_report) || !tud_hid_ready()) return;
+    if (!time_reached(next_report)) return;
+    if (action != ACT_TEXT) {
+        press_step();
+        return;
+    }
+    if (!tud_hid_n_ready(ITF_KEYBOARD)) return;
 
     if (key_down) {
         tud_hid_keyboard_report(0, 0, NULL);
@@ -110,7 +162,6 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_t
 
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
                            uint8_t const *buffer, uint16_t bufsize) {
-    (void)instance;
     (void)report_id;
-    if (report_type == HID_REPORT_TYPE_OUTPUT && bufsize >= 1) host_leds = buffer[0];
+    if (instance == ITF_KEYBOARD && report_type == HID_REPORT_TYPE_OUTPUT && bufsize >= 1) host_leds = buffer[0];
 }

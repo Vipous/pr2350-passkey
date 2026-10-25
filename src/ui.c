@@ -7,8 +7,10 @@
 #include "AMOLED_1in8.h"
 #include "FT3168.h"
 #include "backup.h"
+#include "buttons.h"
 #include "crypto.h"
 #include "editor.h"
+#include "hotkeys.h"
 #include "lvgl.h"
 #include "usb_kbd.h"
 #include "vault.h"
@@ -17,6 +19,7 @@
 #define VER_RES AMOLED_1IN8_HEIGHT
 #define BUF_LINES 40
 #define MARGIN 24   // keeps content clear of the panel's rounded corners
+#define TOP    28   // where the list and the hotkey grid start, now that there's no top bar
 
 #define DIM_AFTER_MS   30000
 #define DIM_BRIGHTNESS 5
@@ -52,7 +55,9 @@ static lv_obj_t *mbox;               // open confirmation dialog, if any
 static lv_timer_t *screen_timer;     // belongs to the current screen, deleted with it
 
 // Which screen is up, so it can be rebuilt when the editor changes the list.
-static enum { SCR_LOCK, SCR_ENROLL, SCR_RESTORE, SCR_LIST, SCR_DETAIL, SCR_SETTINGS, SCR_RECOVERY } screen;
+static enum { SCR_LOCK, SCR_ENROLL, SCR_RESTORE, SCR_LIST, SCR_KEYS, SCR_DETAIL, SCR_SETTINGS, SCR_RECOVERY, SCR_MENU } screen;
+static int main_screen = SCR_LIST;   // Passwords or Hotkeys, whichever was opened last
+static int menu_from;                // where the menu was opened, to go back on a second press
 
 // ---------------------------------------------------------------------------
 // Display and touch glue
@@ -145,6 +150,11 @@ static lv_obj_t *label(lv_obj_t *parent, const char *text, const lv_font_t *font
     return l;
 }
 
+// A transition with no properties: state changes apply at once. LVGL 8.1 dereferences the
+// transition descriptor without a NULL check, so "no transition" has to be a real, empty one.
+static const lv_style_prop_t no_props[] = {0};
+static lv_style_transition_dsc_t no_transition;
+
 static lv_obj_t *button(lv_obj_t *parent, const char *text, uint32_t color, lv_coord_t w, lv_coord_t h,
                         lv_event_cb_t cb, void *user_data) {
     lv_obj_t *b = lv_btn_create(parent);
@@ -152,6 +162,12 @@ static lv_obj_t *button(lv_obj_t *parent, const char *text, uint32_t color, lv_c
     lv_obj_set_style_radius(b, 16, 0);
     lv_obj_set_style_shadow_width(b, 0, 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(color), 0);
+    // The theme grows a pressed button and fades its colour; both repaint it several times over
+    // QSPI, which is what makes large buttons feel sluggish. Change state in one frame instead.
+    lv_obj_set_style_transform_width(b, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_transform_height(b, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_transition(b, &no_transition, 0);
+    lv_obj_set_style_transition(b, &no_transition, LV_STATE_PRESSED);
     if (cb) lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, user_data);
     if (text) {
         lv_obj_t *l = label(b, text, &lv_font_montserrat_24, 0xFFFFFF);
@@ -198,12 +214,14 @@ static lv_obj_t *header(lv_obj_t *scr, const char *title, lv_event_cb_t back_cb)
     return t;
 }
 
-// USB and editor connection icons, top right.
-static void status_icons(lv_obj_t *scr, lv_coord_t right) {
+// USB and (optionally) editor connection icons, top right.
+static void status_icons(lv_obj_t *scr, lv_coord_t right, bool with_editor) {
     usb_label = label(scr, LV_SYMBOL_USB, &lv_font_montserrat_24, COLOR_MUTED);
     lv_obj_align(usb_label, LV_ALIGN_TOP_RIGHT, -right, 26);
-    editor_label = label(scr, LV_SYMBOL_EDIT, &lv_font_montserrat_20, COLOR_MUTED);
-    lv_obj_align(editor_label, LV_ALIGN_TOP_RIGHT, -right - 40, 28);
+    if (with_editor) {
+        editor_label = label(scr, LV_SYMBOL_EDIT, &lv_font_montserrat_20, COLOR_MUTED);
+        lv_obj_align(editor_label, LV_ALIGN_TOP_RIGHT, -right - 40, 28);
+    }
     usb_shown = editor_shown = -1;
 }
 
@@ -517,15 +535,7 @@ static void lock_now(void) {
     show_unlock(NULL);
 }
 
-static void lock_cb(lv_event_t *e) {
-    lock_now();
-}
-
 // --- List ---
-
-static void settings_cb(lv_event_t *e) {
-    show_settings();
-}
 
 static void row_cb(lv_event_t *e) {
     show_detail((int)(intptr_t)lv_event_get_user_data(e));
@@ -539,25 +549,15 @@ static void list_scroll_cb(lv_event_t *e) {
     list_scroll = lv_obj_get_scroll_y(lv_event_get_target(e));
 }
 
+static void show_keys(void);
+
 static void show_list(void) {
-    screen = SCR_LIST;
+    screen = main_screen = SCR_LIST;
     lv_obj_t *scr = new_screen();
-    lv_obj_t *t = header(scr, "Passwords", NULL);
-    lv_obj_t *b = button(scr, LV_SYMBOL_SETTINGS, COLOR_CARD, 56, 52, settings_cb, NULL);
-    lv_obj_align(b, LV_ALIGN_TOP_RIGHT, -MARGIN, 12);
-    lv_coord_t right = MARGIN + 66;
-    if (vault_lock_mode() != LOCK_NONE) {
-        b = button(scr, LV_SYMBOL_POWER, COLOR_CARD, 56, 52, lock_cb, NULL);
-        lv_obj_align(b, LV_ALIGN_TOP_RIGHT, -right, 12);
-        right += 66;
-        lv_obj_set_style_text_font(t, &lv_font_montserrat_24, 0);
-    }
-    status_icons(scr, right + 4);
-    lv_obj_set_width(t, HOR_RES - MARGIN - right - 76);
 
     lv_obj_t *list = lv_obj_create(scr);
-    lv_obj_set_size(list, HOR_RES - 2 * MARGIN + 8, VER_RES - 76 - 16);
-    lv_obj_set_pos(list, MARGIN - 4, 76);
+    lv_obj_set_size(list, HOR_RES - 2 * MARGIN + 8, VER_RES - TOP - 16);
+    lv_obj_set_pos(list, MARGIN - 4, TOP);
     lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(list, 0, 0);
     lv_obj_set_style_pad_all(list, 4, 0);
@@ -593,7 +593,9 @@ static void show_list(void) {
                                 "No passwords yet.\n\n"
                                 "Connect the board to a computer\n"
                                 "and open passkey.html\n"
-                                "in Chrome or Edge to add them.",
+                                "in Chrome or Edge to add them.\n\n"
+                                "BOOT or PWR button:\n"
+                                "modes and settings.",
                                 &lv_font_montserrat_16, COLOR_MUTED);
         lv_obj_set_width(empty, lv_pct(100));
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
@@ -607,6 +609,118 @@ static void show_list(void) {
     show(scr);
 }
 
+// --- Hotkeys ---
+
+static void hotkey_cb(lv_event_t *e) {
+    const hotkey_t *k = hotkeys_get((int)(intptr_t)lv_event_get_user_data(e));
+    if (!k) return;
+    if (!usb_kbd_mounted()) {
+        toast_show(LV_SYMBOL_USB "  Not connected", COLOR_DANGER, 2000);
+        return;
+    }
+    bool ok = k->type == HOTKEY_MEDIA ? usb_kbd_media(k->code) : usb_kbd_combo(k->mods, (uint8_t)k->code);
+    if (!ok) toast_show("Busy, try again", COLOR_DANGER, 1500);
+}
+
+static void show_keys(void) {
+    screen = main_screen = SCR_KEYS;
+    lv_obj_t *scr = new_screen();
+
+    // Four big tiles, 2 x 2, filling the screen: nothing to scroll.
+    const lv_coord_t gap = 12;
+    const lv_coord_t tile_w = (HOR_RES - 2 * MARGIN - gap) / 2;
+    const lv_coord_t tile_h = (VER_RES - 2 * TOP - gap) / 2;
+    int n = hotkeys_count();
+    for (int i = 0; i < n; i++) {
+        const hotkey_t *k = hotkeys_get(i);
+        bool media = k->type == HOTKEY_MEDIA;
+        // Media keys in purple, so they stand apart from shortcuts.
+        lv_obj_t *tile = button(scr, NULL, media ? 0x3A2A5C : COLOR_CARD, tile_w, tile_h, hotkey_cb, (void *)(intptr_t)i);
+        lv_obj_set_pos(tile, MARGIN + (i % 2) * (tile_w + gap), TOP + (i / 2) * (tile_h + gap));
+        lv_obj_set_style_radius(tile, 22, 0);
+        lv_obj_set_style_pad_all(tile, 12, 0);
+        lv_obj_set_style_bg_color(tile, lv_color_hex(COLOR_ACCENT), LV_STATE_PRESSED);
+
+        lv_obj_t *l = label(tile, media ? LV_SYMBOL_AUDIO : LV_SYMBOL_KEYBOARD, &lv_font_montserrat_28, COLOR_MUTED);
+        lv_obj_align(l, LV_ALIGN_TOP_MID, 0, 8);
+        l = label(tile, k->label, &lv_font_montserrat_24, 0xFFFFFF);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(l, tile_w - 24);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(l, LV_ALIGN_CENTER, 0, 4);
+        char desc[40];
+        hotkey_describe(k, desc, sizeof(desc));
+        l = label(tile, desc, &lv_font_montserrat_14, COLOR_MUTED);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(l, tile_w - 24);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(l, LV_ALIGN_BOTTOM_MID, 0, -6);
+    }
+    if (n == 0) {
+        lv_obj_t *empty = label(scr, "No hotkeys yet.\n\nSet them up in passkey.html\non the computer.",
+                                &lv_font_montserrat_16, COLOR_MUTED);
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(empty);
+    }
+    show(scr);
+}
+
+// --- Mode menu (BOOT or PWR button) ---
+
+static void menu_pick_cb(lv_event_t *e) {
+    int target = (int)(intptr_t)lv_event_get_user_data(e);
+    if (target == SCR_LIST) show_list();
+    else if (target == SCR_KEYS) show_keys();
+    else if (target == SCR_SETTINGS) show_settings();
+    else lock_now();
+}
+
+static void show_menu(void) {
+    menu_from = screen;
+    screen = SCR_MENU;
+    lv_obj_t *scr = new_screen();
+    lv_obj_t *t = label(scr, "Mode", &lv_font_montserrat_26, 0xFFFFFF);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 26);
+
+    static const struct { const char *text; int target; } items[] = {
+        {LV_SYMBOL_LIST "   Passwords", SCR_LIST},
+        {LV_SYMBOL_KEYBOARD "   Hotkeys", SCR_KEYS},
+        {LV_SYMBOL_SETTINGS "   Settings", SCR_SETTINGS},
+        {LV_SYMBOL_POWER "   Lock", SCR_LOCK},
+    };
+    int n = vault_lock_mode() != LOCK_NONE ? 4 : 3;   // Lock only means something with a PIN
+    const lv_coord_t h = 72, gap = 14, y0 = 80;
+    for (int i = 0; i < n; i++) {
+        bool current = items[i].target == menu_from || (items[i].target == SCR_LIST && menu_from == SCR_DETAIL) ||
+                       (items[i].target == SCR_SETTINGS && menu_from == SCR_RECOVERY);
+        lv_obj_t *b = button(scr, items[i].text, current ? COLOR_ACCENT : COLOR_CARD, HOR_RES - 2 * MARGIN - 20, h,
+                             menu_pick_cb, (void *)(intptr_t)items[i].target);
+        lv_obj_align(b, LV_ALIGN_TOP_MID, 0, y0 + i * (h + gap));
+        lv_obj_set_style_text_font(lv_obj_get_child(b, 0), &lv_font_montserrat_26, 0);
+    }
+    lv_obj_t *hint = label(scr, "Press the button again to go back", &lv_font_montserrat_14, COLOR_MUTED);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -24);
+    show(scr);
+}
+
+static void show_main(void) {
+    if (main_screen == SCR_KEYS) show_keys();
+    else show_list();
+}
+
+// Button press: open the menu, or close it again.
+static void menu_toggle(void) {
+    if (!vault_is_unlocked() || sec_busy) return;   // never a way around the PIN screen
+    if (screen == SCR_LOCK) return;
+    if (screen != SCR_MENU) {
+        show_menu();
+    } else if (menu_from == SCR_SETTINGS || menu_from == SCR_RECOVERY) {
+        show_settings();
+    } else {
+        show_main();
+    }
+}
+
 // --- Detail ---
 
 static lv_obj_t *det_pass;
@@ -614,6 +728,10 @@ static bool det_revealed;
 
 static void back_to_list_cb(lv_event_t *e) {
     show_list();
+}
+
+static void settings_done_cb(lv_event_t *e) {
+    show_main();
 }
 
 static void det_type_cb(lv_event_t *e) {
@@ -694,7 +812,10 @@ static void lock_off_confirmed(bool yes) {
 static void protection_cb(lv_event_t *e) {
     lv_obj_t *bm = lv_event_get_target(e);
     lock_mode_t want = (lock_mode_t)lv_btnmatrix_get_selected_btn(bm);
-    if (want == vault_lock_mode()) return;
+    if (want == vault_lock_mode()) {
+        lv_btnmatrix_set_btn_ctrl(bm, want, LV_BTNMATRIX_CTRL_CHECKED);   // a second tap would uncheck it
+        return;
+    }
     if (want == LOCK_NONE) {
         confirm("Turn off protection?", "Passwords will be stored unencrypted and open without a PIN.",
                 "Turn off", lock_off_confirmed);
@@ -762,8 +883,8 @@ static void show_recovery(void) {
 static void show_settings(void) {
     screen = SCR_SETTINGS;
     lv_obj_t *scr = new_screen();
-    header(scr, "Settings", back_to_list_cb);
-    status_icons(scr, MARGIN);
+    header(scr, "Settings", settings_done_cb);
+    status_icons(scr, MARGIN, true);
     const int w = HOR_RES - 2 * MARGIN;
 
     lv_obj_t *l = label(scr, "BRIGHTNESS", &lv_font_montserrat_14, COLOR_MUTED);
@@ -829,6 +950,11 @@ static void show_settings(void) {
 // ---------------------------------------------------------------------------
 
 static void tick_cb(lv_timer_t *t) {
+    if (buttons_pressed()) {
+        lv_disp_trig_activity(NULL);   // also wakes a dimmed screen
+        menu_toggle();
+    }
+
     if (typing && !usb_kbd_busy()) {
         typing = false;
         toast_show(LV_SYMBOL_OK "  Done", COLOR_OK, 1200);
@@ -876,6 +1002,7 @@ void ui_main(void) {
     gpio_set_irq_enabled_with_callback(Touch_INT_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, touch_irq_cb);
 
     lv_init();
+    lv_style_transition_dsc_init(&no_transition, no_props, lv_anim_path_linear, 0, 0, NULL);
     lv_disp_draw_buf_init(&draw_buf, buf_a, buf_b, HOR_RES * BUF_LINES);
     lv_disp_drv_init(&disp_drv);
     disp_drv.hor_res = HOR_RES;
@@ -905,6 +1032,8 @@ void ui_main(void) {
     lv_obj_align(toast, LV_ALIGN_BOTTOM_MID, 0, -40);
     lv_obj_add_flag(toast, LV_OBJ_FLAG_HIDDEN);
 
+    hotkeys_init();
+    buttons_init();   // AXP2101 on I2C1, next to touch
     vault_init();
     if (vault_is_unlocked()) show_list();
     else show_unlock(NULL);
@@ -928,6 +1057,7 @@ void ui_main(void) {
             list_scroll = 0;
             // A wipe from the editor also clears the lock, so the lock screen can go too.
             if (screen == SCR_LIST || screen == SCR_DETAIL || (screen == SCR_LOCK && vault_is_unlocked())) show_list();
+            else if (screen == SCR_KEYS) show_keys();
             else if (screen == SCR_SETTINGS) show_settings();
         }
         lv_timer_handler();

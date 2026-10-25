@@ -17,8 +17,12 @@
 //   RESTORE <bytes>, then R <base64> per chunk, then RESTORE_END merge|replace -> OK <entries>;
 //     the board then asks for the recovery code on screen, and
 //   RESTORE_STATUS                         -> OK waiting | done <added> <skipped> | cancelled | failed | idle
+//   KEYS                                   -> K <label> <type> <modifiers> <code> ... OK <count>
+//   KEYS_BEGIN <n>, then n x KEY <label> <type> <modifiers> <code>, then KEYS_END -> OK
+//     (type 0: key combination, code = HID keyboard usage; 1: media key, code = consumer usage)
+//   KEYS_RESET                             -> OK   (back to the default panel)
 // Errors come back as "ERR <message>"; "ERR locked" means the board must be unlocked on screen
-// first (WIPE still works). Passwords are never sent back to the computer.
+// first (WIPE and the KEYS commands still work). Passwords are never sent back to the computer.
 //
 // editor_task() runs on core 0 after tud_task(); the vault lives on core 1, which carries out
 // the requests in editor_service().
