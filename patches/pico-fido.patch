@@ -1,8 +1,37 @@
 diff --git a/src/fido/cbor_client_pin.c b/src/fido/cbor_client_pin.c
-index c26f392..f3cd508 100644
+index c26f392..4b41b3a 100644
 --- a/src/fido/cbor_client_pin.c
 +++ b/src/fido/cbor_client_pin.c
-@@ -954,3 +954,75 @@ err:
+@@ -114,6 +114,9 @@ static int beginUsingPinUvAuthToken(bool userIsPresent) {
+ void clearUserPresentFlag(void) {
+     if (paut.in_use == true && paut.user_present) {
+         paut.user_present = false;
++#ifdef FORCE_BUTTON_WAIT
++        user_present_time_limit = 0;   // used up: check_user_presence must ask again
++#endif
+         fido_object_authorization_session_invalidate();
+     }
+ }
+@@ -912,7 +915,18 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
+         }
+         else {
+             resetPinUvAuthToken();
++#ifdef FORCE_BUTTON_WAIT
++            // Browsers ask to touch the key, then for the PIN, then send the request. That touch was
++            // the user saying yes on screen: count it for this token, so the request after the PIN
++            // doesn't ask a second time. Once, and only right after it.
++            bool present = selection_confirmed_at != 0 && board_millis() - selection_confirmed_at < 60000;
++            // Without a recent time pin_uv_auth_token_tick would clear the flag at once.
++            user_present_time_limit = present ? selection_confirmed_at : 0;
++            selection_confirmed_at = 0;
++            beginUsingPinUvAuthToken(present);
++#else
+             beginUsingPinUvAuthToken(false);
++#endif
+             if (subcommand == 0x05) {
+                 permissions = CTAP_PERMISSION_MC | CTAP_PERMISSION_GA;
+             }
+@@ -954,3 +968,75 @@ err:
      res_APDU_size = (uint16_t)resp_size;
      return 0;
  }
@@ -126,6 +155,27 @@ index 589acf4..375d7c3 100644
      }
      flash_commit();
  err:
+diff --git a/src/fido/cbor_selection.c b/src/fido/cbor_selection.c
+index 9109843..bc00824 100644
+--- a/src/fido/cbor_selection.c
++++ b/src/fido/cbor_selection.c
+@@ -21,6 +21,9 @@
+ #include "ctap.h"
+ #include "button.h"
+ #include "event.h"
++#if defined(PICO_PLATFORM)
++#include "bsp/board.h"
++#endif
+ 
+ extern char *rp_id, *user_name, *display_name;
+ extern size_t rp_id_len;
+@@ -43,5 +46,6 @@ int cbor_selection(void) {
+     else if (ret == 2) {
+         return CTAP2_ERR_OPERATION_DENIED;
+     }
++    selection_confirmed_at = board_millis();
+     return CTAP2_OK;
+ }
 diff --git a/src/fido/credential.c b/src/fido/credential.c
 index e32f98d..68aeeaf 100644
 --- a/src/fido/credential.c
@@ -154,7 +204,7 @@ index bf296e9..2e9767a 100644
  
  #endif // _CREDENTIAL_H_
 diff --git a/src/fido/fido.c b/src/fido/fido.c
-index 93120fd..e4e1f98 100644
+index 93120fd..62cafe1 100644
 --- a/src/fido/fido.c
 +++ b/src/fido/fido.c
 @@ -554,6 +554,13 @@ int wait_button_pressed_timeout(uint32_t timeout_seconds) {
@@ -171,7 +221,15 @@ index 93120fd..e4e1f98 100644
      } while (val != EV_BUTTON_PRESSED && val != EV_BUTTON_TIMEOUT && val != EV_BUTTON_CANCELLED);
  #endif
      if (val == EV_BUTTON_TIMEOUT) {
-@@ -625,7 +632,11 @@ uint8_t get_opts(void) {
+@@ -566,6 +573,7 @@ int wait_button_pressed_timeout(uint32_t timeout_seconds) {
+ }
+ 
+ uint32_t user_present_time_limit = 0;
++uint32_t selection_confirmed_at = 0;
+ 
+ static bool check_user_presence_internal(uint32_t timeout_seconds, bool honor_force) {
+     (void) honor_force;
+@@ -625,7 +633,11 @@ uint8_t get_opts(void) {
      if (file_has_data(ef)) {
          return *file_get_data(ef);
      }
@@ -183,3 +241,16 @@ index 93120fd..e4e1f98 100644
  }
  
  void set_opts(uint8_t opts) {
+diff --git a/src/fido/fido.h b/src/fido/fido.h
+index 100e07a..dcc8d1d 100644
+--- a/src/fido/fido.h
++++ b/src/fido/fido.h
+@@ -157,6 +157,8 @@ typedef struct persistentPinUvAuthToken {
+ } persistentPinUvAuthToken_t;
+ 
+ extern uint32_t user_present_time_limit;
++// Pass Key: when the user last confirmed authenticatorSelection ("touch your key"), 0 if not since.
++extern uint32_t selection_confirmed_at;
+ 
+ extern pinUvAuthToken_t paut;
+ extern persistentPinUvAuthToken_t ppaut;
