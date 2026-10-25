@@ -15,6 +15,7 @@
 #include "lvgl.h"
 #include "usb_kbd.h"
 #include "pass_vault.h"
+#include "pet.h"
 
 #define HOR_RES AMOLED_1IN8_WIDTH
 #define VER_RES AMOLED_1IN8_HEIGHT
@@ -57,9 +58,15 @@ static lv_obj_t *fido_overlay;       // security key confirmation, over everythi
 static lv_timer_t *screen_timer;     // belongs to the current screen, deleted with it
 
 // Which screen is up, so it can be rebuilt when the editor changes the list.
-static enum { SCR_LOCK, SCR_ENROLL, SCR_RESTORE, SCR_LIST, SCR_KEYS, SCR_DETAIL, SCR_SETTINGS, SCR_RECOVERY, SCR_MENU } screen;
+static enum { SCR_LOCK, SCR_ENROLL, SCR_RESTORE, SCR_LIST, SCR_KEYS, SCR_DETAIL, SCR_SETTINGS, SCR_RECOVERY, SCR_MENU,
+              SCR_HOME } screen;
 static int main_screen = SCR_LIST;   // Passwords or Hotkeys, whichever was opened last
 static int menu_from;                // where the menu was opened, to go back on a second press
+static int settings_from;            // Settings goes back here: the cat or the main screen
+
+// How the cat screen opens the passwords: chosen in Settings, to try out which is handier.
+enum { OPEN_DOUBLE_TAP, OPEN_HOLD };
+static int open_gesture = OPEN_DOUBLE_TAP;
 
 // ---------------------------------------------------------------------------
 // Display and touch glue
@@ -314,6 +321,8 @@ static void type_entry(const vault_entry_t *e, type_what_t what) {
 // Screens
 
 static void show_list(void);
+static void show_home(void);
+static void show_main(void);
 static void show_detail(int index);
 static void show_settings(void);
 static void show_recovery(void);
@@ -667,14 +676,67 @@ static void show_keys(void) {
     show(scr);
 }
 
+// --- Home: the cat ---
+
+static uint32_t last_tap;
+static bool held;
+
+static void home_hint_cb(lv_timer_t *t) {
+    lv_obj_add_flag((lv_obj_t *)t->user_data, LV_OBJ_FLAG_HIDDEN);
+    lv_timer_pause(t);   // stays the screen's timer; new_screen() deletes it
+}
+
+static void home_touch_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        held = false;
+    } else if (code == LV_EVENT_LONG_PRESSED) {
+        if (open_gesture == OPEN_HOLD) {
+            held = true;
+            show_main();
+        }
+    } else if (code == LV_EVENT_CLICKED && !held) {
+        // A tap strokes the cat; with the double-tap setting, a second one soon after opens the list.
+        uint32_t now = lv_tick_get();
+        if (open_gesture == OPEN_DOUBLE_TAP && last_tap && now - last_tap < 450) {
+            last_tap = 0;
+            show_main();
+            return;
+        }
+        last_tap = now;
+        pet_stroke();
+    }
+}
+
+static void show_home(void) {
+    screen = SCR_HOME;
+    lv_obj_t *scr = new_screen();
+    lv_obj_t *pet = pet_create(scr);
+    lv_obj_add_event_cb(pet, home_touch_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(pet, home_touch_cb, LV_EVENT_LONG_PRESSED, NULL);
+    lv_obj_add_event_cb(pet, home_touch_cb, LV_EVENT_CLICKED, NULL);
+    last_tap = 0;
+
+    // How to get to the passwords, for a few seconds after the screen appears.
+    lv_obj_t *hint = label(scr, open_gesture == OPEN_HOLD ? "Hold to open passwords" : "Double-tap to open passwords",
+                           &lv_font_montserrat_16, COLOR_MUTED);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_clear_flag(hint, LV_OBJ_FLAG_CLICKABLE);
+    screen_timer = lv_timer_create(home_hint_cb, 4000, hint);
+    show(scr);
+}
+
 // --- Mode menu (BOOT or PWR button) ---
 
 static void menu_pick_cb(lv_event_t *e) {
     int target = (int)(intptr_t)lv_event_get_user_data(e);
-    if (target == SCR_LIST) show_list();
+    if (target == SCR_HOME) show_home();
+    else if (target == SCR_LIST) show_list();
     else if (target == SCR_KEYS) show_keys();
-    else if (target == SCR_SETTINGS) show_settings();
-    else lock_now();
+    else if (target == SCR_SETTINGS) {
+        if (menu_from != SCR_SETTINGS && menu_from != SCR_RECOVERY) settings_from = menu_from == SCR_HOME ? SCR_HOME : SCR_LIST;
+        show_settings();
+    } else lock_now();
 }
 
 static void show_menu(void) {
@@ -682,16 +744,17 @@ static void show_menu(void) {
     screen = SCR_MENU;
     lv_obj_t *scr = new_screen();
     lv_obj_t *t = label(scr, "Mode", &lv_font_montserrat_26, 0xFFFFFF);
-    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 26);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 22);
 
     static const struct { const char *text; int target; } items[] = {
+        {LV_SYMBOL_HOME "   Cat", SCR_HOME},
         {LV_SYMBOL_LIST "   Passwords", SCR_LIST},
         {LV_SYMBOL_KEYBOARD "   Hotkeys", SCR_KEYS},
         {LV_SYMBOL_SETTINGS "   Settings", SCR_SETTINGS},
         {LV_SYMBOL_POWER "   Lock", SCR_LOCK},
     };
-    int n = vault_lock_mode() != LOCK_NONE ? 4 : 3;   // Lock only means something with a PIN
-    const lv_coord_t h = 72, gap = 14, y0 = 80;
+    int n = vault_lock_mode() != LOCK_NONE ? 5 : 4;   // Lock only means something with a PIN
+    const lv_coord_t h = 60, gap = 10, y0 = 66;
     for (int i = 0; i < n; i++) {
         bool current = items[i].target == menu_from || (items[i].target == SCR_LIST && menu_from == SCR_DETAIL) ||
                        (items[i].target == SCR_SETTINGS && menu_from == SCR_RECOVERY);
@@ -701,7 +764,7 @@ static void show_menu(void) {
         lv_obj_set_style_text_font(lv_obj_get_child(b, 0), &lv_font_montserrat_26, 0);
     }
     lv_obj_t *hint = label(scr, "Press the button again to go back", &lv_font_montserrat_14, COLOR_MUTED);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -24);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -20);
     show(scr);
 }
 
@@ -718,6 +781,8 @@ static void menu_toggle(void) {
         show_menu();
     } else if (menu_from == SCR_SETTINGS || menu_from == SCR_RECOVERY) {
         show_settings();
+    } else if (menu_from == SCR_HOME) {
+        show_home();
     } else {
         show_main();
     }
@@ -733,7 +798,8 @@ static void back_to_list_cb(lv_event_t *e) {
 }
 
 static void settings_done_cb(lv_event_t *e) {
-    show_main();
+    if (settings_from == SCR_HOME) show_home();
+    else show_main();
 }
 
 static void det_type_cb(lv_event_t *e) {
@@ -882,34 +948,15 @@ static void show_recovery(void) {
     show(scr);
 }
 
-static void show_settings(void) {
-    screen = SCR_SETTINGS;
-    lv_obj_t *scr = new_screen();
-    header(scr, "Settings", settings_done_cb);
-    status_icons(scr, MARGIN, true);
-    const int w = HOR_RES - 2 * MARGIN;
-
-    lv_obj_t *l = label(scr, "BRIGHTNESS", &lv_font_montserrat_14, COLOR_MUTED);
-    lv_obj_set_pos(l, MARGIN, 90);
-    lv_obj_t *s = lv_slider_create(scr);
-    lv_obj_set_size(s, w - 40, 20);
-    lv_obj_set_pos(s, MARGIN + 20, 128);
-    lv_obj_set_style_pad_all(s, 10, LV_PART_KNOB);   // a knob big enough for a finger
-    lv_obj_set_ext_click_area(s, 20);
-    lv_slider_set_range(s, 10, 100);
-    lv_slider_set_value(s, brightness, LV_ANIM_OFF);
-    lv_obj_add_event_cb(s, brightness_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-    l = label(scr, "PROTECTION", &lv_font_montserrat_14, COLOR_MUTED);
-    lv_obj_set_pos(l, MARGIN, 172);
-    static const char *prot_map[] = {"Off", "PIN", ""};
+// A row of mutually exclusive choices, like Off | PIN.
+static lv_obj_t *segmented(lv_obj_t *scr, const char **map, int checked, lv_coord_t y) {
     lv_obj_t *bm = lv_btnmatrix_create(scr);
-    lv_btnmatrix_set_map(bm, prot_map);
+    lv_btnmatrix_set_map(bm, map);
     lv_btnmatrix_set_btn_ctrl_all(bm, LV_BTNMATRIX_CTRL_CHECKABLE);
     lv_btnmatrix_set_one_checked(bm, true);
-    lv_btnmatrix_set_btn_ctrl(bm, vault_lock_mode(), LV_BTNMATRIX_CTRL_CHECKED);
-    lv_obj_set_size(bm, w, 64);
-    lv_obj_set_pos(bm, MARGIN, 194);
+    lv_btnmatrix_set_btn_ctrl(bm, checked, LV_BTNMATRIX_CTRL_CHECKED);
+    lv_obj_set_size(bm, HOR_RES - 2 * MARGIN, 56);
+    lv_obj_set_pos(bm, MARGIN, y);
     lv_obj_set_style_pad_all(bm, 4, 0);
     lv_obj_set_style_pad_gap(bm, 6, 0);
     lv_obj_set_style_bg_color(bm, lv_color_hex(COLOR_CARD), 0);
@@ -920,20 +967,57 @@ static void show_settings(void) {
     lv_obj_set_style_bg_opa(bm, LV_OPA_COVER, LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_bg_color(bm, lv_color_hex(COLOR_ACCENT), LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_text_font(bm, &lv_font_montserrat_20, LV_PART_ITEMS);
+    return bm;
+}
+
+static void open_gesture_cb(lv_event_t *e) {
+    uint16_t sel = lv_btnmatrix_get_selected_btn(lv_event_get_target(e));
+    if (sel != LV_BTNMATRIX_BTN_NONE) open_gesture = sel == 1 ? OPEN_HOLD : OPEN_DOUBLE_TAP;
+}
+
+static void show_settings(void) {
+    screen = SCR_SETTINGS;
+    lv_obj_t *scr = new_screen();
+    header(scr, "Settings", settings_done_cb);
+    status_icons(scr, MARGIN, true);
+    const int w = HOR_RES - 2 * MARGIN;
+
+    lv_obj_t *l = label(scr, "BRIGHTNESS", &lv_font_montserrat_14, COLOR_MUTED);
+    lv_obj_set_pos(l, MARGIN, 84);
+    lv_obj_t *s = lv_slider_create(scr);
+    lv_obj_set_size(s, w - 40, 20);
+    lv_obj_set_pos(s, MARGIN + 20, 116);
+    lv_obj_set_style_pad_all(s, 10, LV_PART_KNOB);   // a knob big enough for a finger
+    lv_obj_set_ext_click_area(s, 20);
+    lv_slider_set_range(s, 10, 100);
+    lv_slider_set_value(s, brightness, LV_ANIM_OFF);
+    lv_obj_add_event_cb(s, brightness_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    l = label(scr, "PROTECTION", &lv_font_montserrat_14, COLOR_MUTED);
+    lv_obj_set_pos(l, MARGIN, 150);
+    static const char *prot_map[] = {"Off", "PIN", ""};
+    lv_obj_t *bm = segmented(scr, prot_map, vault_lock_mode(), 172);
     lv_obj_add_event_cb(bm, protection_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    lv_coord_t y = 272;
+    lv_coord_t y = 240;
     if (vault_lock_mode() != LOCK_NONE) {
         const int hw = (w - 12) / 2;
-        lv_obj_t *b = button(scr, "Change PIN", COLOR_CARD, hw, 56, change_secret_cb, NULL);
+        lv_obj_t *b = button(scr, "Change PIN", COLOR_CARD, hw, 52, change_secret_cb, NULL);
         lv_obj_set_pos(b, MARGIN, y);
-        b = button(scr, "Backup code", COLOR_CARD, hw, 56, recovery_cb, NULL);
+        b = button(scr, "Backup code", COLOR_CARD, hw, 52, recovery_cb, NULL);
         lv_obj_set_pos(b, MARGIN + hw + 12, y);
     } else {
-        lv_obj_t *b = button(scr, "Backup recovery code", COLOR_CARD, w, 56, recovery_cb, NULL);
+        lv_obj_t *b = button(scr, "Backup recovery code", COLOR_CARD, w, 52, recovery_cb, NULL);
         lv_obj_set_pos(b, MARGIN, y);
     }
-    y += 70;
+    y += 64;
+
+    l = label(scr, "OPEN PASSWORDS FROM THE CAT", &lv_font_montserrat_14, COLOR_MUTED);
+    lv_obj_set_pos(l, MARGIN, y);
+    static const char *open_map[] = {"Double-tap", "Hold", ""};
+    bm = segmented(scr, open_map, open_gesture, y + 22);
+    lv_obj_add_event_cb(bm, open_gesture_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    y += 22 + 56 + 10;
 
     l = label(scr, "", &lv_font_montserrat_14, COLOR_MUTED);
     if (vault_lock_mode() == LOCK_NONE)
@@ -981,13 +1065,17 @@ static void tick_cb(lv_timer_t *t) {
     uint32_t idle = lv_disp_get_inactive_time(NULL);
     if (vault_lock_mode() != LOCK_NONE && vault_is_unlocked() && idle > LOCK_AFTER_MS && !typing) lock_now();
 
-    // AMOLED: dim when idle to avoid burn-in.
+    // AMOLED: dim when idle to avoid burn-in. The cat naps meanwhile.
     if (!dimmed && idle > DIM_AFTER_MS) {
         dimmed = true;
         AMOLED_1IN8_SetBrightness(DIM_BRIGHTNESS);
+        pet_set_sleepy(true);
+        // Left alone, the passwords give way to the cat: nothing to type by accident.
+        if ((screen == SCR_LIST || screen == SCR_KEYS || screen == SCR_DETAIL) && !typing && !fido_overlay) show_home();
     } else if (dimmed && idle < DIM_AFTER_MS) {
         dimmed = false;
         AMOLED_1IN8_SetBrightness(brightness);
+        pet_set_sleepy(false);
     }
 }
 
@@ -1078,6 +1166,7 @@ void ui_init(void) {
     lv_indev_drv_init(&indev_drv);
     indev_drv.type = LV_INDEV_TYPE_POINTER;
     indev_drv.read_cb = touch_read_cb;
+    indev_drv.long_press_time = 700;   // "Hold" on the cat screen
     lv_indev_drv_register(&indev_drv);
 
     // The display DMA interrupt is serviced on this core, like everything else in the UI.
@@ -1098,7 +1187,7 @@ void ui_init(void) {
     hotkeys_init();
     buttons_init();   // AXP2101 on I2C1, next to touch
     vault_init();
-    if (vault_is_unlocked()) show_list();
+    if (vault_is_unlocked()) show_home();
     else show_unlock(NULL);
     lv_timer_create(tick_cb, 100, NULL);
 }

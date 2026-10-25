@@ -21,6 +21,7 @@ add_executable(pass_key
     src/fido_glue.c
     src/fido_keys.c
     src/fido_manage.c
+    src/pet.c
     src/ui.c
 )
 
