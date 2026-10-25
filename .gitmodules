@@ -2,3 +2,6 @@
 	path = third_party/pico-fido
 	url = https://github.com/polhenarejos/pico-fido.git
 	ignore = dirty
+[submodule "third_party/lvgl"]
+	path = third_party/lvgl
+	url = https://github.com/lvgl/lvgl.git

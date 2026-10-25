@@ -1,5 +1,11 @@
 # Pass Key: аппаратный ввод паролей на RP2350-Touch-AMOLED-1.8
 
+> **English summary.** Firmware for the Waveshare RP2350-Touch-AMOLED-1.8 board: a USB keyboard that types
+> passwords picked on its touch screen, a panel of hotkeys, and a FIDO2 security key (passkeys, built on
+> [pico-fido](https://github.com/polhenarejos/pico-fido)) with an on-screen Allow/Deny. Passwords are
+> managed from a browser page over Web Serial (`tools/passkey.html`), optionally encrypted with a PIN, with
+> encrypted backups. The home screen is a pixel cat. The documentation below is in Russian. License: AGPL-3.0.
+
 Плата [Waveshare RP2350-Touch-AMOLED-1.8](https://www.waveshare.com/wiki/RP2350-Touch-AMOLED-1.8) подключается
 к компьютеру и определяется как USB-клавиатура. На экране выбираете запись и нажимаете кнопку, а плата сама
 набирает пароль в поле, где стоит курсор. Драйверы не нужны (macOS, Windows, Linux). Работает и в BIOS/UEFI,
@@ -152,13 +158,14 @@ Web Serial, а его нет в Safari и Firefox. Интернет не нуж�
 
 ## Сборка
 
-Нужны Pico SDK 2.1+, `arm-none-eabi-gcc`, CMake, Ninja и git. Библиотеки платы (Waveshare и LVGL)
-по умолчанию берутся из `../RP2350-Touch-AMOLED-1.8/lib`. Другой путь задаётся через `-DBOARD_LIB_DIR=...`.
+Нужны Pico SDK 2.1+, `arm-none-eabi-gcc`, CMake, Ninja и git.
 
-pico-fido подключён подмодулем git в `third_party/pico-fido`, на проверенной версии. После клонирования
-проекта его нужно скачать:
+pico-fido и LVGL 8.1 подключены подмодулями git (`third_party/pico-fido`, `third_party/lvgl`), на проверенных
+версиях; драйверы экрана и тача от Waveshare лежат в `third_party/waveshare`. Клонируйте вместе с подмодулями:
 
 ```bash
+git clone --recursive <адрес репозитория>
+# или, если уже склонировали:
 git submodule update --init --recursive
 ```
 
@@ -205,8 +212,9 @@ USB-интерфейсы: 0 — FIDO (pico-fido ждёт свой интерфе
   таблицы разделов, синхронная запись во flash и с ядра 0. Правки pico-fido (`patches/pico-fido.patch`): подтверждение перед каждой подписью
   и регистрацией, отмена ожидания при сбросе канала хостом и обязательный PIN по умолчанию
   (`DEFAULT_ALWAYS_UV`, после сброса тоже).
-- **Стек ядра 1** 32 КБ: регистрация с PIN доходит почти до 11 КБ. Глубина стека пишется в журнал FIDO,
-  а MSPLIM превращает переполнение в сбой вместо порчи памяти.
+- **Стек ядра 1** 32 КБ: регистрация с PIN доходит почти до 11 КБ. MSPLIM превращает переполнение в сбой
+  вместо порчи памяти. Если основной цикл зависнет или прошивка упадёт, через 8 секунд плату
+  перезагрузит сторожевой таймер.
 - **Тестовая сборка** `-DPASSKEY_AUTO_ALLOW=ON` подтверждает запросы FIDO сама, чтобы гонять ключ
   с компьютера (например, python-fido2). Только для отладки: такой ключ подписывает что угодно.
 - **Разметка flash** (`src/flash_store.h`): прошивка до 1,5 МБ; с 1,5 до 3,5 МБ — данные pico-fido;
@@ -230,9 +238,17 @@ USB-интерфейсы: 0 — FIDO (pico-fido ждёт свой интерфе
 
 ### Лицензия
 
-pico-fido распространяется под AGPL-3.0, поэтому собранная прошивка тоже подпадает под AGPL-3.0.
+Проект распространяется под **AGPL-3.0** (файл `LICENSE`): в прошивку входит pico-fido под той же лицензией.
 Для личного использования ограничений нет. Если вы передаёте кому-то прошитую плату или файл прошивки,
 вы обязаны предоставить и исходный код (этот репозиторий вместе с патчами).
+
+Сторонний код: [pico-fido и pico-keys-sdk](https://github.com/polhenarejos/pico-fido) (AGPL-3.0),
+[LVGL](https://github.com/lvgl/lvgl) 8.1 (MIT), драйверы платы от Waveshare в `third_party/waveshare`
+(MIT, текст лицензии в заголовках файлов), mbedtls и tinycbor (скачивает pico-keys-sdk при сборке).
+
+**USB VID/PID.** Плата представляется как `CAFE:4A23`: это тестовый VID из примеров TinyUSB, он годится для
+личного устройства, но не для распространения готовых плат. Для этого нужен свой VID/PID
+(`PASSKEY_VID`, `PASSKEY_PID` в `src/usb_descriptors.c` и список `PIDS` в `tools/passkey.html`).
 
 ### Безопасность
 
@@ -257,6 +273,7 @@ pico-fido распространяется под AGPL-3.0, поэтому со�
 - `src/fido_keys.c`: мастер-ключ FIDO во flash вместо OTP
 - `src/fido_manage.*`: список и удаление passkeys для страницы, даты и счётчики входов
 - `third_party/pico-fido`: pico-fido (подмодуль), `patches/`: правки к нему
+- `third_party/lvgl`: LVGL 8.1 (подмодуль), `third_party/waveshare`: драйверы экрана, QSPI и тача
 - `src/flash_store.*`: запись во flash и разметка областей
 - `src/crypto.*`: SHA-256, HMAC, PBKDF2, потоковый шифр
 - `src/ui.c`, `src/lv_conf.h`: интерфейс на экране

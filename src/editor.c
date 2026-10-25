@@ -421,29 +421,6 @@ static void handle_line(char *s) {
     } else if (strcmp(cmd, "KEYS_RESET") == 0) {
         waiting_op = OP_KEYS_RESET;
         post(OP_KEYS_RESET, 0);
-    } else if (strcmp(cmd, "FIDOLOG") == 0) {
-        // Diagnostics: CTAPHID traffic and presence events; small enough to fit the output buffer.
-        // FIDOLOG [first] -> L lines while they fit, then "OK <next first> <total>".
-        char line_buf[64];
-        int i = n > 1 ? atoi(f[1]) : 0;
-        if (i == 0 && fido_log_crash()[0]) reply("M\t%s\n", fido_log_crash());
-        if (i == 0) {
-            uint32_t pcs[16];
-            fido_log_pcs(pcs);
-            reply("C");
-            for (int k = 0; k < 16; k++) reply("\t%08lx", (unsigned long)pcs[k]);
-            reply("\n");
-        }
-        for (; i < fido_log_count() && out_len < sizeof(out) / 2; i++) {
-            fido_log_format(i, line_buf, sizeof(line_buf));
-            reply("L\t%s\n", line_buf);
-        }
-        reply("OK %d %d\n", i, fido_log_count());
-        return;
-    } else if (strcmp(cmd, "FIDOLOG_CLEAR") == 0) {
-        fido_log_clear();
-        reply("OK\n");
-        return;
     } else if (strcmp(cmd, "TIME") == 0) {
         // TIME <unix seconds>: the board has no clock; the page tells it, for passkey dates.
         long long t = n > 1 ? atoll(f[1]) : 0;

@@ -64,23 +64,20 @@ include(${PICO_KEYS_DIR}/cmake/version.cmake)
 include(${PICO_KEYS_DIR}/picokeys_sdk_import.cmake)
 SET_BUILD_NUMBER("${PICO_FIDO_DIR}")
 
-# Waveshare drivers and LVGL 8.1 from the board's demo package.
-set(BOARD_LIB_DIR ${CMAKE_CURRENT_LIST_DIR}/../RP2350-Touch-AMOLED-1.8/lib
-    CACHE PATH "Directory with the waveshare/ and lvgl/ libraries")
-if(NOT EXISTS ${BOARD_LIB_DIR}/lvgl/lvgl.h)
-    message(FATAL_ERROR "Board libraries not found in ${BOARD_LIB_DIR}, pass -DBOARD_LIB_DIR=...")
+# LVGL 8.1 (submodule, the version Waveshare's demo uses), configured by src/lv_conf.h
+set(LVGL_DIR ${CMAKE_CURRENT_LIST_DIR}/third_party/lvgl)
+if(NOT EXISTS ${LVGL_DIR}/lvgl.h)
+    message(FATAL_ERROR "LVGL not found: run git submodule update --init --recursive")
 endif()
-
-# LVGL, configured by src/lv_conf.h
-file(GLOB_RECURSE LVGL_SOURCES ${BOARD_LIB_DIR}/lvgl/src/*.c)
+file(GLOB_RECURSE LVGL_SOURCES ${LVGL_DIR}/src/*.c)
 add_library(lvgl STATIC ${LVGL_SOURCES})
-target_include_directories(lvgl PUBLIC ${BOARD_LIB_DIR}/lvgl ${CMAKE_CURRENT_LIST_DIR}/src)
+target_include_directories(lvgl PUBLIC ${LVGL_DIR} ${CMAKE_CURRENT_LIST_DIR}/src)
 target_compile_definitions(lvgl PUBLIC LV_CONF_INCLUDE_SIMPLE)
 target_compile_options(lvgl PRIVATE -O2 -w)
 target_link_libraries(lvgl PUBLIC pico_stdlib)
 
-# Board drivers: QSPI display over PIO, SH8601 AMOLED, FT3168 touch
-set(WS ${BOARD_LIB_DIR}/waveshare)
+# Board drivers from Waveshare's demo (MIT): QSPI display over PIO, SH8601 AMOLED, FT3168 touch
+set(WS ${CMAKE_CURRENT_LIST_DIR}/third_party/waveshare)
 add_library(waveshare STATIC
     ${WS}/Config/DEV_Config.c
     ${WS}/QSPI_PIO/qspi_pio.c
@@ -97,7 +94,7 @@ target_include_directories(pass_key PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
 target_compile_options(pass_key PRIVATE -O2 -Wall)
 target_link_libraries(pass_key PRIVATE
     pico_stdlib pico_multicore pico_unique_id pico_rand pico_flash
-    hardware_flash hardware_watchdog hardware_exception
+    hardware_flash hardware_watchdog
     tinyusb_device
     waveshare lvgl
 )
@@ -126,7 +123,6 @@ target_compile_definitions(pass_key PRIVATE
     PICOKEYS_FLASH_DATA_END=0x380000     # FIDO_DATA_FLASH_END
     PICOKEYS_NO_LED=1                    # GPIO 25 isn't a status LED on this board
     PICOKEYS_CUSTOM_BUTTON=1             # presence comes from the screen, see src/fido_glue.c
-    PICO_PANIC_FUNCTION=passkey_panic    # panics are recorded in the FIDO log, src/fido_glue.c
     FORCE_BUTTON_WAIT=1                  # always ask on screen before signing (patches/pico-fido.patch)
     DEFAULT_ALWAYS_UV=1                  # FIDO PIN required for every passkey (patches/pico-fido.patch)
 )

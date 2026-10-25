@@ -173,7 +173,6 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_t
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
                            uint8_t const *buffer, uint16_t bufsize) {
     if (instance == HID_FIDO) {
-        fido_log_packet(true, buffer, bufsize);
         picok_hid_set_report_cb(instance, report_id, report_type, buffer, bufsize);
         return;
     }
@@ -183,7 +182,6 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
 
 void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t len) {
     if (instance == HID_FIDO) {
-        fido_log_packet(false, report, len);
         picok_hid_report_complete_cb(instance, report, len);
     }
 }
