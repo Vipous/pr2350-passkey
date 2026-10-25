@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "vault.h"
+#include "pass_vault.h"
 
 // Backup files: all entries, encrypted with a key derived from the board's 24-digit recovery
 // code. The code never leaves the board, so the computer only ever sees ciphertext.

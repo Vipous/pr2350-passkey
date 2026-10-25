@@ -10,10 +10,11 @@
 #include "buttons.h"
 #include "crypto.h"
 #include "editor.h"
+#include "fido_glue.h"
 #include "hotkeys.h"
 #include "lvgl.h"
 #include "usb_kbd.h"
-#include "vault.h"
+#include "pass_vault.h"
 
 #define HOR_RES AMOLED_1IN8_WIDTH
 #define VER_RES AMOLED_1IN8_HEIGHT
@@ -52,6 +53,7 @@ static lv_obj_t *usb_label;      // on screens that show the connection state, e
 static lv_obj_t *editor_label;
 static int usb_shown = -1, editor_shown = -1;
 static lv_obj_t *mbox;               // open confirmation dialog, if any
+static lv_obj_t *fido_overlay;       // security key confirmation, over everything else
 static lv_timer_t *screen_timer;     // belongs to the current screen, deleted with it
 
 // Which screen is up, so it can be rebuilt when the editor changes the list.
@@ -710,7 +712,7 @@ static void show_main(void) {
 
 // Button press: open the menu, or close it again.
 static void menu_toggle(void) {
-    if (!vault_is_unlocked() || sec_busy) return;   // never a way around the PIN screen
+    if (!vault_is_unlocked() || sec_busy || fido_overlay) return;   // never a way around the PIN screen
     if (screen == SCR_LOCK) return;
     if (screen != SCR_MENU) {
         show_menu();
@@ -989,7 +991,68 @@ static void tick_cb(lv_timer_t *t) {
     }
 }
 
-void ui_main(void) {
+// --- Security key confirmation (pico-fido asks for user presence) ---
+
+static lv_obj_t *fido_buttons[2], *fido_status;
+
+static void fido_answer_cb(lv_event_t *e) {
+    bool allow = (bool)(intptr_t)lv_event_get_user_data(e);
+    fido_presence_answer(allow);
+    // Visible right away; the overlay closes when pico-fido has taken the answer.
+    for (int i = 0; i < 2; i++) lv_obj_add_flag(fido_buttons[i], LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(fido_status, allow ? LV_SYMBOL_OK "  Confirmed" : "Denied");
+    lv_obj_set_style_text_color(fido_status, lv_color_hex(allow ? COLOR_OK : COLOR_DANGER), 0);
+}
+
+// Shown over whatever screen is up, so nothing underneath is lost; removed when pico-fido
+// reports the request done, cancelled or timed out.
+static void fido_overlay_update(void) {
+    fido_ask_t ask = fido_presence_pending();
+    if (ask == FIDO_ASK_NONE) {
+        if (fido_overlay) {
+            lv_obj_del(fido_overlay);
+            fido_overlay = NULL;
+        }
+        return;
+    }
+    if (fido_overlay) return;
+
+    lv_disp_trig_activity(NULL);   // wakes a dimmed screen
+    fido_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(fido_overlay, HOR_RES, VER_RES);
+    lv_obj_set_style_bg_color(fido_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(fido_overlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(fido_overlay, 0, 0);
+    lv_obj_set_style_radius(fido_overlay, 0, 0);
+    lv_obj_clear_flag(fido_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    static const char *const titles[] = {"", "Sign in?", "Create a passkey?", "Security key"};
+    lv_obj_t *l = label(fido_overlay, LV_SYMBOL_WARNING, &lv_font_montserrat_28, COLOR_ACCENT);
+    lv_obj_align(l, LV_ALIGN_TOP_MID, 0, 34);
+    l = label(fido_overlay, titles[ask], &lv_font_montserrat_28, 0xFFFFFF);
+    lv_obj_align(l, LV_ALIGN_TOP_MID, 0, 84);
+
+    const char *site = fido_presence_site();
+    l = label(fido_overlay, site[0] ? site : "a website or app", &lv_font_montserrat_24, site[0] ? 0xFFFFFF : COLOR_MUTED);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(l, HOR_RES - 2 * MARGIN);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(l, LV_ALIGN_TOP_MID, 0, 140);
+    l = label(fido_overlay, "Confirm only if you started this\non the computer.", &lv_font_montserrat_16, COLOR_MUTED);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(l, LV_ALIGN_TOP_MID, 0, 214);
+
+    fido_status = label(fido_overlay, "", &lv_font_montserrat_26, COLOR_OK);
+    lv_obj_align(fido_status, LV_ALIGN_BOTTOM_MID, 0, -110);
+
+    const lv_coord_t w = HOR_RES - 2 * MARGIN;
+    fido_buttons[0] = button(fido_overlay, LV_SYMBOL_OK "  Allow", COLOR_OK, w, 76, fido_answer_cb, (void *)(intptr_t)true);
+    lv_obj_align(fido_buttons[0], LV_ALIGN_BOTTOM_MID, 0, -112);
+    fido_buttons[1] = button(fido_overlay, "Deny", COLOR_CARD, w, 64, fido_answer_cb, (void *)(intptr_t)false);
+    lv_obj_align(fido_buttons[1], LV_ALIGN_BOTTOM_MID, 0, -32);
+}
+
+void ui_init(void) {
     QSPI_GPIO_Init(qspi);
     QSPI_PIO_Init(qspi);
     QSPI_4Wrie_Mode(&qspi);
@@ -1017,7 +1080,7 @@ void ui_main(void) {
     indev_drv.read_cb = touch_read_cb;
     lv_indev_drv_register(&indev_drv);
 
-    // Registered from core 1, so the display DMA interrupt is serviced here.
+    // The display DMA interrupt is serviced on this core, like everything else in the UI.
     dma_channel_set_irq0_enabled(dma_tx, true);
     irq_set_exclusive_handler(DMA_IRQ_0, dma_handler);
     irq_set_enabled(DMA_IRQ_0, true);
@@ -1038,29 +1101,29 @@ void ui_main(void) {
     if (vault_is_unlocked()) show_list();
     else show_unlock(NULL);
     lv_timer_create(tick_cb, 100, NULL);
+}
 
+void ui_task(void) {
     // Rebuilt shortly after the editor's last change, not once per entry during an import.
-    absolute_time_t refresh_at = nil_time;
-    while (true) {
-        // Editor requests are handled here rather than in a timer so listing stays quick.
-        editor_set_state(!vault_is_unlocked(), vault_lock_mode());
-        editor_activity_t act = editor_service();
-        if (act != EDITOR_IDLE) lv_disp_trig_activity(NULL);   // editing counts as use: no auto-lock
-        if (act == EDITOR_CHANGED) refresh_at = make_timeout_time_ms(300);
-        // A backup was uploaded: ask for its code here on the board.
-        if (editor_restore_waiting() && vault_is_unlocked() && screen != SCR_RESTORE && !sec_busy) {
-            lv_disp_trig_activity(NULL);
-            show_pin_screen(PURPOSE_RESTORE, NULL);
-        }
-        if (!is_nil_time(refresh_at) && time_reached(refresh_at)) {
-            refresh_at = nil_time;
-            list_scroll = 0;
-            // A wipe from the editor also clears the lock, so the lock screen can go too.
-            if (screen == SCR_LIST || screen == SCR_DETAIL || (screen == SCR_LOCK && vault_is_unlocked())) show_list();
-            else if (screen == SCR_KEYS) show_keys();
-            else if (screen == SCR_SETTINGS) show_settings();
-        }
-        lv_timer_handler();
-        sleep_ms(2);
+    static absolute_time_t refresh_at;
+    fido_overlay_update();
+    // Editor requests are handled here rather than in a timer so listing stays quick.
+    editor_set_state(!vault_is_unlocked(), vault_lock_mode());
+    editor_activity_t act = editor_service();
+    if (act != EDITOR_IDLE) lv_disp_trig_activity(NULL);   // editing counts as use: no auto-lock
+    if (act == EDITOR_CHANGED) refresh_at = make_timeout_time_ms(300);
+    // A backup was uploaded: ask for its code here on the board.
+    if (editor_restore_waiting() && vault_is_unlocked() && screen != SCR_RESTORE && !sec_busy) {
+        lv_disp_trig_activity(NULL);
+        show_pin_screen(PURPOSE_RESTORE, NULL);
     }
+    if (!is_nil_time(refresh_at) && time_reached(refresh_at)) {
+        refresh_at = nil_time;
+        list_scroll = 0;
+        // A wipe from the editor also clears the lock, so the lock screen can go too.
+        if (screen == SCR_LIST || screen == SCR_DETAIL || (screen == SCR_LOCK && vault_is_unlocked())) show_list();
+        else if (screen == SCR_KEYS) show_keys();
+        else if (screen == SCR_SETTINGS) show_settings();
+    }
+    lv_timer_handler();
 }

@@ -1,0 +1,158 @@
+diff --git a/picokeys_sdk_import.cmake b/picokeys_sdk_import.cmake
+index 365212e..d73a53f 100644
+--- a/picokeys_sdk_import.cmake
++++ b/picokeys_sdk_import.cmake
+@@ -715,7 +715,11 @@ endif()
+ 
+ if(PICO_RP2350)
+     pico_set_uf2_family(${CMAKE_PROJECT_NAME} "rp2350-arm-s")
+-    pico_embed_pt_in_binary(${CMAKE_PROJECT_NAME} "${CMAKE_CURRENT_LIST_DIR}/config/rp2350/pt.json")
++    # Firmware with its own flash layout sets PICOKEYS_NO_PARTITION_TABLE and passes the data
++    # region as PICOKEYS_FLASH_DATA_START/END instead.
++    if(NOT PICOKEYS_NO_PARTITION_TABLE)
++        pico_embed_pt_in_binary(${CMAKE_PROJECT_NAME} "${CMAKE_CURRENT_LIST_DIR}/config/rp2350/pt.json")
++    endif()
+     if(SECURE_BOOT_PKEY)
+         message(STATUS "Secure Boot Key ${SECURE_BOOT_PKEY}")
+         pico_sign_binary(${CMAKE_PROJECT_NAME} ${SECURE_BOOT_PKEY})
+diff --git a/src/button.c b/src/button.c
+index 96cf21a..c38217a 100644
+--- a/src/button.c
++++ b/src/button.c
+@@ -92,9 +92,14 @@ static bool __no_inline_not_in_flash_func(picok_get_bootsel_button)(void) {
+ 
+     return button_state;
+ }
+-static bool picok_board_button_read(void) {
++// The user-presence "button". Firmware with its own way of confirming (a screen, another key)
++// can provide a strong definition; it should read true while the user confirms.
++__attribute__((weak)) bool picokeys_board_button_read(void) {
+   return picok_get_bootsel_button();
+ }
++static bool picok_board_button_read(void) {
++  return picokeys_board_button_read();
++}
+ #else
+ static bool picok_board_button_read(void) {
+     return true; // always unpressed
+@@ -184,6 +189,18 @@ void button_wait_poll(void) {
+     }
+ }
+ 
++// Drops a pending wait without telling the card thread, for when that thread is being shut down
++// (card_exit). A late "pressed" or "timeout" would otherwise reach the next thread as a command.
++void button_wait_abort(void) {
++    if (!async_button_wait) {
++        return;
++    }
++    async_button_wait = false;
++    req_button_pending = false;
++    led_set_mode(async_button_led_mode);
++    signal_emit(SIGNAL_USER_PRESENCE_CANCELLED);
++}
++
+ #endif
+ 
+ uint32_t button_timeout_seconds(void) {
+@@ -201,13 +218,15 @@ void button_task(void) {
+ #ifndef ENABLE_EMULATION
+     uint32_t now = board_millis();
+     if (now > 1000 && now - button_last_poll >= 10 && (async_button_wait || !is_busy())) { // wait 1 second to boot up
+-#ifdef PICO_PLATFORM
++// Reading BOOTSEL stops flash access, so the other core is paused; a custom button
++// (PICOKEYS_CUSTOM_BUTTON) is read without that.
++#if defined(PICO_PLATFORM) && !defined(PICOKEYS_CUSTOM_BUTTON)
+         if (!multicore_lockout_start_timeout_us(1000)) {
+             return;
+         }
+ #endif
+         bool current_button_state = picok_board_button_read();
+-#ifdef PICO_PLATFORM
++#if defined(PICO_PLATFORM) && !defined(PICOKEYS_CUSTOM_BUTTON)
+         multicore_lockout_end_timeout_us(1000);
+ #endif
+         button_last_poll = now;
+diff --git a/src/button.h b/src/button.h
+index f7ca1c9..22b2f85 100644
+--- a/src/button.h
++++ b/src/button.h
+@@ -34,6 +34,7 @@ typedef enum {
+ 
+ extern void button_wait_start(void);
+ extern void button_wait_poll(void);
++extern void button_wait_abort(void);
+ extern volatile uint32_t button_pressed_duration;
+ extern void button_task(void);
+ extern volatile bool cancel_button;
+diff --git a/src/fs/low_flash.c b/src/fs/low_flash.c
+index 5ac7185..1e7a468 100644
+--- a/src/fs/low_flash.c
++++ b/src/fs/low_flash.c
+@@ -566,7 +566,11 @@ void low_flash_init(void) {
+     flash_do_cmd(txbuf, rxbuf, 4);
+ 
+     FLASH_SIZE_BYTES = (1 << rxbuf[3]);
+-#ifdef PICO_RP2350
++#if defined(PICOKEYS_FLASH_DATA_START) && defined(PICOKEYS_FLASH_DATA_END)
++    // The firmware embedding the SDK owns the flash layout and hands over a fixed region.
++    data_start_addr = PICOKEYS_FLASH_DATA_START;
++    data_end_addr = PICOKEYS_FLASH_DATA_END;
++#elif defined(PICO_RP2350)
+     __attribute__((aligned(4))) uint32_t workarea[1024];
+     int rc = rom_load_partition_table((uint8_t *)workarea, sizeof(workarea), false);
+     if (rc) {
+diff --git a/src/led/led.c b/src/led/led.c
+index 145cafb..43eba9c 100644
+--- a/src/led/led.c
++++ b/src/led/led.c
+@@ -166,7 +166,11 @@ led_driver_t led_driver_dummy = {
+ 
+ void led_init(void) {
+     led_driver = &led_driver_dummy;
+-#if defined(PICO_PLATFORM) || defined(ESP_PLATFORM)
++#if defined(PICOKEYS_NO_LED)
++    // The board has no status LED for the SDK, or its default pin is used by something else.
++    led_driver->init();
++    led_set_mode(MODE_NOT_MOUNTED);
++#elif defined(PICO_PLATFORM) || defined(ESP_PLATFORM)
+     // Guess default driver
+ #if defined(PIMORONI_TINY2040) || defined(PIMORONI_TINY2350)
+     led_driver = &led_driver_pimoroni;
+diff --git a/src/usb/usb.c b/src/usb/usb.c
+index 91fdf11..fd38f38 100644
+--- a/src/usb/usb.c
++++ b/src/usb/usb.c
+@@ -269,6 +269,13 @@ void card_init_core1(void) {
+ 
+ volatile uint16_t finished_data_size = 0;
+ 
++// Starts a card thread on core 1. Firmware that keeps its own loop on core 1 (and so must not
++// have it reset) can provide a strong definition that hands the function over instead.
++__attribute__((weak)) void picokeys_core1_launch(void *(*func)(void *)) {
++    multicore_reset_core1();
++    multicore_launch_func_core1(func);
++}
++
+ void card_start(uint8_t itf, void *(*func)(void *)) {
+     timeout_start();
+     if (card_locked_itf != itf || card_locked_func != func) {
+@@ -276,8 +283,7 @@ void card_start(uint8_t itf, void *(*func)(void *)) {
+             card_exit();
+         }
+         if (func) {
+-            multicore_reset_core1();
+-            multicore_launch_func_core1(func);
++            picokeys_core1_launch(func);
+         }
+         led_set_mode(MODE_MOUNTED);
+         card_locked_itf = itf;
+@@ -287,6 +293,9 @@ void card_start(uint8_t itf, void *(*func)(void *)) {
+ 
+ void card_exit(void) {
+     if (card_locked_itf != ITF_TOTAL || card_locked_func != NULL) {
++#ifndef ENABLE_EMULATION
++        button_wait_abort();
++#endif
+         usb_send_event(EV_EXIT);
+         uint32_t m;
+         while (queue_is_empty(&usb_to_card_q) == false) {

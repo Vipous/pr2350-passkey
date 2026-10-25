@@ -6,7 +6,7 @@
 #include "hardware/structs/ioqspi.h"
 #include "hardware/structs/sio.h"
 #include "hardware/sync.h"
-#include "pico/flash.h"
+#include "flash_store.h"
 
 // AXP2101 power chip: PWR key short press shows up as an interrupt status bit.
 #define AXP_ADDR       0x34
@@ -52,7 +52,7 @@ bool buttons_pressed(void) {
     bool pressed = false;
 
     bool boot_down = false;
-    if (flash_safe_execute(read_boot_cb, &boot_down, 10) == PICO_OK) {
+    if (flash_safe_call(read_boot_cb, &boot_down)) {
         if (boot_down && !boot_was_down) pressed = true;
         boot_was_down = boot_down;
     }

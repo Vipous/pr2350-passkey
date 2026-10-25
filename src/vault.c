@@ -1,4 +1,4 @@
-#include "vault.h"
+#include "pass_vault.h"
 
 #include <stddef.h>
 #include <string.h>

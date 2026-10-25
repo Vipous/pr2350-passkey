@@ -1,0 +1,60 @@
+diff --git a/src/fido/cbor_get_assertion.c b/src/fido/cbor_get_assertion.c
+index 7caa61a..ad3e23c 100644
+--- a/src/fido/cbor_get_assertion.c
++++ b/src/fido/cbor_get_assertion.c
+@@ -537,6 +537,9 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
+             : false
+ #endif
+         );
++#ifdef FORCE_BUTTON_WAIT
++        require_button = numberOfCredentials > 0;   // ask before every signature, whatever the credential says
++#endif
+ 
+         if (options.up == ptrue || options.present == false || options.up == NULL) { //9.1
+             if (pinUvAuthParam.present == true) {
+diff --git a/src/fido/cbor_make_credential.c b/src/fido/cbor_make_credential.c
+index 589acf4..0b37f57 100644
+--- a/src/fido/cbor_make_credential.c
++++ b/src/fido/cbor_make_credential.c
+@@ -543,6 +543,11 @@ int cbor_make_credential(const uint8_t *data, size_t len) {
+ #endif
+             }
+         }
++#ifdef FORCE_BUTTON_WAIT
++        else if (check_user_presence() == false) {   // no PIN: still ask the user
++            CBOR_ERROR(CTAP2_ERR_OPERATION_DENIED);
++        }
++#endif
+         flags |= FIDO2_AUT_FLAG_UP;
+         clearUserPresentFlag();
+         clearUserVerifiedFlag();
+diff --git a/src/fido/fido.c b/src/fido/fido.c
+index 93120fd..e4e1f98 100644
+--- a/src/fido/fido.c
++++ b/src/fido/fido.c
+@@ -554,6 +554,13 @@ int wait_button_pressed_timeout(uint32_t timeout_seconds) {
+     queue_try_add(&card_to_usb_q, &val);
+     do {
+         queue_remove_blocking(&usb_to_card_q, &val);
++        if (val == EV_EXIT) {
++            // The host reset the channel (CTAPHID_INIT) while we waited. Dropping EV_EXIT here would
++            // leave core 0 waiting for its acknowledgement forever; put it back so the card thread
++            // answers it once this command has unwound, and treat the wait as cancelled.
++            queue_add_blocking(&usb_to_card_q, &val);
++            val = EV_BUTTON_CANCELLED;
++        }
+     } while (val != EV_BUTTON_PRESSED && val != EV_BUTTON_TIMEOUT && val != EV_BUTTON_CANCELLED);
+ #endif
+     if (val == EV_BUTTON_TIMEOUT) {
+@@ -625,7 +632,11 @@ uint8_t get_opts(void) {
+     if (file_has_data(ef)) {
+         return *file_get_data(ef);
+     }
++#ifdef DEFAULT_ALWAYS_UV
++    return FIDO2_OPT_AUV;   // a PIN for every registration and sign-in, until set otherwise
++#else
+     return 0;
++#endif
+ }
+ 
+ void set_opts(uint8_t opts) {
