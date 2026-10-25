@@ -6,6 +6,8 @@
 #include "DEV_Config.h"   // must precede the Waveshare headers (UBYTE/UWORD)
 #include "AMOLED_1in8.h"
 #include "FT3168.h"
+#include "backup.h"
+#include "crypto.h"
 #include "editor.h"
 #include "lvgl.h"
 #include "usb_kbd.h"
@@ -18,6 +20,10 @@
 
 #define DIM_AFTER_MS   30000
 #define DIM_BRIGHTNESS 5
+#define LOCK_AFTER_MS  (5 * 60 * 1000)   // with a PIN set
+
+#define PIN_MIN 4
+#define PIN_MAX 12
 
 #define COLOR_CARD   0x1C1C1E
 #define COLOR_ACCENT 0x0A84FF
@@ -42,9 +48,11 @@ static lv_timer_t *toast_timer;
 static lv_obj_t *usb_label;      // on screens that show the connection state, else NULL
 static lv_obj_t *editor_label;
 static int usb_shown = -1, editor_shown = -1;
+static lv_obj_t *mbox;               // open confirmation dialog, if any
+static lv_timer_t *screen_timer;     // belongs to the current screen, deleted with it
 
 // Which screen is up, so it can be rebuilt when the editor changes the list.
-static enum { SCR_LIST, SCR_DETAIL, SCR_SETTINGS } screen;
+static enum { SCR_LOCK, SCR_ENROLL, SCR_RESTORE, SCR_LIST, SCR_DETAIL, SCR_SETTINGS, SCR_RECOVERY } screen;
 
 // ---------------------------------------------------------------------------
 // Display and touch glue
@@ -153,6 +161,10 @@ static lv_obj_t *button(lv_obj_t *parent, const char *text, uint32_t color, lv_c
 }
 
 static lv_obj_t *new_screen(void) {
+    if (screen_timer) {
+        lv_timer_del(screen_timer);
+        screen_timer = NULL;
+    }
     lv_obj_t *s = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(s, lv_color_black(), 0);
     lv_obj_clear_flag(s, LV_OBJ_FLAG_SCROLLABLE);
@@ -161,6 +173,10 @@ static lv_obj_t *new_screen(void) {
 }
 
 static void show(lv_obj_t *s) {
+    if (mbox) {
+        lv_msgbox_close_async(mbox);
+        mbox = NULL;
+    }
     lv_obj_t *old = lv_scr_act();
     lv_scr_load(s);
     // Async: show() is usually called from an event of a widget on the old screen.
@@ -211,6 +227,32 @@ static void toast_show(const char *msg, uint32_t color, uint32_t ms) {
     }
 }
 
+typedef void (*confirm_fn)(bool yes);
+
+static void confirm_cb(lv_event_t *e) {
+    lv_obj_t *m = lv_event_get_current_target(e);
+    confirm_fn fn = (confirm_fn)lv_event_get_user_data(e);
+    bool yes = lv_msgbox_get_active_btn(m) == 1;
+    lv_msgbox_close_async(m);
+    mbox = NULL;
+    fn(yes);
+}
+
+static void confirm(const char *title, const char *text, const char *yes, confirm_fn fn) {
+    static const char *btns[3];
+    btns[0] = "Cancel";
+    btns[1] = yes;
+    btns[2] = "";
+    mbox = lv_msgbox_create(NULL, title, text, btns, false);
+    lv_obj_set_width(mbox, HOR_RES - 2 * MARGIN);
+    lv_obj_t *bm = lv_msgbox_get_btns(mbox);
+    lv_obj_set_height(bm, 56);
+    lv_obj_set_style_bg_color(bm, lv_color_hex(COLOR_DANGER), LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_btnmatrix_set_btn_ctrl(bm, 1, LV_BTNMATRIX_CTRL_CHECKED);
+    lv_obj_add_event_cb(mbox, confirm_cb, LV_EVENT_VALUE_CHANGED, (void *)fn);
+    lv_obj_center(mbox);
+}
+
 // ---------------------------------------------------------------------------
 // Typing
 
@@ -254,9 +296,230 @@ static void type_entry(const vault_entry_t *e, type_what_t what) {
 static void show_list(void);
 static void show_detail(int index);
 static void show_settings(void);
+static void show_recovery(void);
 
 static int cur_index;   // entry on the detail screen
 static lv_coord_t list_scroll;
+
+// --- Digit entry: unlocking, setting a PIN, restoring a backup ---
+
+// What the digits being entered are for.
+enum { PURPOSE_UNLOCK, PURPOSE_NEW, PURPOSE_REPEAT, PURPOSE_RESTORE };
+
+static int sec_purpose;
+static bool sec_busy;
+static char sec_first[VAULT_SECRET_MAX + 1];   // first entry while setting a new secret
+static char sec_work[VAULT_SECRET_MAX + 1];    // handed to the slow vault call
+static lv_obj_t *sec_info;
+
+static void show_pin_screen(int purpose, const char *info);
+
+static void show_unlock(const char *info) {
+    show_pin_screen(PURPOSE_UNLOCK, info);
+}
+
+// Runs from a one-shot timer, so "Unlocking..." is on screen during the slow key derivation.
+static void sec_work_cb(lv_timer_t *t) {
+    sec_busy = false;
+    if (sec_purpose == PURPOSE_UNLOCK) {
+        unlock_result_t r = vault_unlock(sec_work);
+        if (r == UNLOCK_OK) {
+            show_list();
+        } else if (r == UNLOCK_WIPED) {
+            show_list();
+            toast_show("Too many attempts: all erased", COLOR_DANGER, 4000);
+        } else {
+            char msg[48];
+            int left = vault_attempts_left();
+            if (left >= 0) snprintf(msg, sizeof(msg), "Wrong PIN. Attempts left: %d", left);
+            else snprintf(msg, sizeof(msg), "Wrong PIN");
+            show_unlock(msg);
+        }
+    } else if (sec_purpose == PURPOSE_RESTORE) {
+        size_t len;
+        bool replace;
+        int entries, added, skipped;
+        const uint8_t *data = editor_restore_data(&len, &replace, &entries);
+        // A board that never showed its own code takes over the backup's, so the code on paper
+        // keeps working. A code once shown never changes behind the user's back.
+        bool adopt = !vault_has_recovery_code();
+        restore_result_t r = backup_import(data, len, sec_work, replace, &added, &skipped);
+        if (r == RESTORE_WRONG_CODE) {
+            show_pin_screen(PURPOSE_RESTORE, "Wrong code, try again");
+        } else {
+            if (r == RESTORE_OK && adopt) vault_set_recovery_code(sec_work);
+            editor_restore_finish(r == RESTORE_OK, added, skipped);
+            list_scroll = 0;
+            show_list();
+            if (r == RESTORE_OK) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Restored %d, skipped %d", added, skipped);
+                toast_show(msg, COLOR_OK, 3000);
+            } else {
+                toast_show(r == RESTORE_BAD_FILE ? "Not a Pass Key backup" : "Flash write failed", COLOR_DANGER, 3000);
+            }
+        }
+    } else {
+        bool ok = vault_set_lock(LOCK_PIN, sec_work);
+        show_settings();
+        if (ok) toast_show("PIN set", COLOR_OK, 2000);
+        else toast_show("Flash write failed", COLOR_DANGER, 2000);
+    }
+    secure_zero(sec_work, sizeof(sec_work));
+    secure_zero(sec_first, sizeof(sec_first));
+}
+
+static void sec_submit(const char *secret) {
+    switch (sec_purpose) {
+    case PURPOSE_NEW:
+        snprintf(sec_first, sizeof(sec_first), "%s", secret);
+        show_pin_screen(PURPOSE_REPEAT, NULL);
+        return;
+    case PURPOSE_REPEAT:
+        if (strcmp(secret, sec_first) != 0) {
+            secure_zero(sec_first, sizeof(sec_first));
+            show_pin_screen(PURPOSE_NEW, "Did not match, start again");
+            return;
+        }
+        lv_label_set_text(sec_info, "Saving...");
+        break;
+    case PURPOSE_RESTORE:
+        lv_label_set_text(sec_info, "Checking the code...");
+        break;
+    default:
+        lv_label_set_text(sec_info, "Unlocking...");
+        break;
+    }
+    lv_obj_set_style_text_color(sec_info, lv_color_hex(COLOR_MUTED), 0);
+    snprintf(sec_work, sizeof(sec_work), "%s", secret);
+    sec_busy = true;
+    lv_timer_t *t = lv_timer_create(sec_work_cb, 50, NULL);
+    lv_timer_set_repeat_count(t, 1);
+}
+
+static void sec_back_cb(lv_event_t *e) {
+    secure_zero(sec_first, sizeof(sec_first));
+    if (sec_purpose == PURPOSE_RESTORE) {
+        editor_restore_finish(false, 0, 0);
+        show_list();
+        toast_show("Restore cancelled", COLOR_CARD, 1500);
+        return;
+    }
+    show_settings();
+}
+
+// --- PIN pad ---
+
+static lv_obj_t *pin_ta;
+
+static const char *pin_pad_map[] = {"1", "2", "3", "\n", "4", "5", "6", "\n", "7", "8", "9", "\n",
+                                    LV_SYMBOL_BACKSPACE, "0", LV_SYMBOL_OK, ""};
+
+static void pin_pad_cb(lv_event_t *e) {
+    if (sec_busy) return;
+    lv_obj_t *pad = lv_event_get_target(e);
+    const char *txt = lv_btnmatrix_get_btn_text(pad, lv_btnmatrix_get_selected_btn(pad));
+    if (!txt) return;
+    if (strcmp(txt, LV_SYMBOL_BACKSPACE) == 0) {
+        lv_textarea_del_char(pin_ta);
+    } else if (strcmp(txt, LV_SYMBOL_OK) == 0) {
+        const char *pin = lv_textarea_get_text(pin_ta);
+        if (sec_purpose == PURPOSE_RESTORE && strlen(pin) != VAULT_RECOVERY_LEN) {
+            lv_label_set_text_fmt(sec_info, "The code has %d digits", VAULT_RECOVERY_LEN);
+            lv_obj_set_style_text_color(sec_info, lv_color_hex(COLOR_DANGER), 0);
+            return;
+        }
+        if (sec_purpose != PURPOSE_RESTORE && strlen(pin) < PIN_MIN) {
+            lv_label_set_text_fmt(sec_info, "PIN must be %d to %d digits", PIN_MIN, PIN_MAX);
+            lv_obj_set_style_text_color(sec_info, lv_color_hex(COLOR_DANGER), 0);
+            return;
+        }
+        char buf[VAULT_SECRET_MAX + 1];
+        strncpy(buf, pin, sizeof(buf) - 1);
+        buf[VAULT_SECRET_MAX] = 0;
+        secure_zero((char *)pin, strlen(pin));
+        sec_submit(buf);
+        secure_zero(buf, sizeof(buf));
+    } else {
+        lv_textarea_add_text(pin_ta, txt);
+    }
+}
+
+static void build_pin(lv_obj_t *scr) {
+    // The recovery code is long and not secret on its own (it only opens a file), so it's shown.
+    bool code = sec_purpose == PURPOSE_RESTORE;
+    pin_ta = lv_textarea_create(scr);
+    lv_textarea_set_one_line(pin_ta, true);
+    lv_textarea_set_password_mode(pin_ta, !code);
+    lv_textarea_set_password_show_time(pin_ta, 0);
+    lv_textarea_set_max_length(pin_ta, code ? VAULT_RECOVERY_LEN : PIN_MAX);
+    lv_textarea_set_accepted_chars(pin_ta, "0123456789");
+    lv_obj_set_style_text_font(pin_ta, code ? &lv_font_montserrat_20 : &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_align(pin_ta, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_bg_color(pin_ta, lv_color_hex(COLOR_CARD), 0);
+    lv_obj_set_style_border_width(pin_ta, 0, 0);
+    lv_obj_clear_flag(pin_ta, LV_OBJ_FLAG_CLICKABLE);   // the pad below is the only input
+    lv_obj_set_size(pin_ta, HOR_RES - 2 * MARGIN - 40, 58);
+    lv_obj_align(pin_ta, LV_ALIGN_TOP_MID, 0, 74);
+
+    lv_obj_t *pad = lv_btnmatrix_create(scr);
+    lv_btnmatrix_set_map(pad, pin_pad_map);
+    lv_obj_set_size(pad, HOR_RES - 2 * MARGIN - 20, 244);
+    lv_obj_align(pad, LV_ALIGN_BOTTOM_MID, 0, -22);
+    lv_obj_set_style_bg_opa(pad, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pad, 0, 0);
+    lv_obj_set_style_pad_all(pad, 0, 0);
+    lv_obj_set_style_pad_gap(pad, 10, 0);
+    lv_obj_set_style_radius(pad, 14, LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(pad, lv_color_hex(COLOR_CARD), LV_PART_ITEMS);
+    lv_obj_set_style_text_font(pad, &lv_font_montserrat_28, LV_PART_ITEMS);
+    lv_btnmatrix_set_btn_ctrl(pad, 11, LV_BTNMATRIX_CTRL_CHECKED);
+    lv_obj_set_style_bg_color(pad, lv_color_hex(COLOR_ACCENT), LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_add_event_cb(pad, pin_pad_cb, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+static void show_pin_screen(int purpose, const char *info) {
+    static const char *const titles[] = {"Enter PIN", "New PIN", "Repeat the PIN", "Restore backup"};
+    sec_purpose = purpose;
+    sec_busy = false;
+    screen = purpose == PURPOSE_UNLOCK ? SCR_LOCK : purpose == PURPOSE_RESTORE ? SCR_RESTORE : SCR_ENROLL;
+
+    lv_obj_t *scr = new_screen();
+    lv_obj_t *t = header(scr, titles[purpose], purpose == PURPOSE_UNLOCK ? NULL : sec_back_cb);
+    if (purpose == PURPOSE_UNLOCK) {
+        lv_obj_set_width(t, HOR_RES - 2 * MARGIN);
+        lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
+    }
+
+    char hint[96] = "";
+    if (purpose == PURPOSE_NEW) {
+        strcpy(hint, "4 to 12 digits");
+    } else if (purpose == PURPOSE_RESTORE) {
+        size_t len;
+        bool replace;
+        int entries;
+        editor_restore_data(&len, &replace, &entries);
+        snprintf(hint, sizeof(hint), "%d entries, %s.\nEnter the backup's recovery code.", entries,
+                 replace ? "replacing the list" : "added to the list");
+    }
+    sec_info = label(scr, info ? info : hint, &lv_font_montserrat_16, info ? COLOR_DANGER : COLOR_MUTED);
+    lv_obj_set_width(sec_info, HOR_RES - 2 * MARGIN);
+    lv_obj_set_style_text_align(sec_info, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(sec_info, LV_LABEL_LONG_WRAP);
+    lv_obj_align(sec_info, LV_ALIGN_TOP_MID, 0, 140);
+
+    build_pin(scr);
+    show(scr);
+}
+
+static void lock_now(void) {
+    vault_lock();
+    show_unlock(NULL);
+}
+
+static void lock_cb(lv_event_t *e) {
+    lock_now();
+}
 
 // --- List ---
 
@@ -279,10 +542,18 @@ static void list_scroll_cb(lv_event_t *e) {
 static void show_list(void) {
     screen = SCR_LIST;
     lv_obj_t *scr = new_screen();
-    header(scr, "Passwords", NULL);
-    status_icons(scr, MARGIN + 74);
-    lv_obj_t *b = button(scr, LV_SYMBOL_SETTINGS, COLOR_CARD, 60, 52, settings_cb, NULL);
+    lv_obj_t *t = header(scr, "Passwords", NULL);
+    lv_obj_t *b = button(scr, LV_SYMBOL_SETTINGS, COLOR_CARD, 56, 52, settings_cb, NULL);
     lv_obj_align(b, LV_ALIGN_TOP_RIGHT, -MARGIN, 12);
+    lv_coord_t right = MARGIN + 66;
+    if (vault_lock_mode() != LOCK_NONE) {
+        b = button(scr, LV_SYMBOL_POWER, COLOR_CARD, 56, 52, lock_cb, NULL);
+        lv_obj_align(b, LV_ALIGN_TOP_RIGHT, -right, 12);
+        right += 66;
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_24, 0);
+    }
+    status_icons(scr, right + 4);
+    lv_obj_set_width(t, HOR_RES - MARGIN - right - 76);
 
     lv_obj_t *list = lv_obj_create(scr);
     lv_obj_set_size(list, HOR_RES - 2 * MARGIN + 8, VER_RES - 76 - 16);
@@ -414,6 +685,80 @@ static void brightness_cb(lv_event_t *e) {
     AMOLED_1IN8_SetBrightness(brightness);
 }
 
+static void lock_off_confirmed(bool yes) {
+    if (yes && !vault_set_lock(LOCK_NONE, NULL)) toast_show("Flash write failed", COLOR_DANGER, 2000);
+    else if (yes) toast_show("Protection off", COLOR_OK, 2000);
+    show_settings();   // also puts the selector back after "Cancel"
+}
+
+static void protection_cb(lv_event_t *e) {
+    lv_obj_t *bm = lv_event_get_target(e);
+    lock_mode_t want = (lock_mode_t)lv_btnmatrix_get_selected_btn(bm);
+    if (want == vault_lock_mode()) return;
+    if (want == LOCK_NONE) {
+        confirm("Turn off protection?", "Passwords will be stored unencrypted and open without a PIN.",
+                "Turn off", lock_off_confirmed);
+    } else {
+        show_pin_screen(PURPOSE_NEW, NULL);
+    }
+}
+
+static void recovery_cb(lv_event_t *e) {
+    show_recovery();
+}
+
+static void settings_back_cb(lv_event_t *e) {
+    show_settings();
+}
+
+static void change_secret_cb(lv_event_t *e) {
+    show_pin_screen(PURPOSE_NEW, NULL);
+}
+
+static void show_recovery(void) {
+    const char *code = vault_recovery_code();   // made and saved on first use
+    if (!code) {
+        toast_show("Flash write failed", COLOR_DANGER, 2000);
+        return;
+    }
+    screen = SCR_RECOVERY;
+    lv_obj_t *scr = new_screen();
+    header(scr, "Recovery code", settings_back_cb);
+    const int w = HOR_RES - 2 * MARGIN;
+
+    char text[VAULT_RECOVERY_LEN + 8];
+    size_t n = 0;
+    for (int i = 0; i < VAULT_RECOVERY_LEN; i++) {
+        if (i && i % 4 == 0) text[n++] = i % 12 == 0 ? '\n' : ' ';
+        text[n++] = code[i];
+    }
+    text[n] = 0;
+    lv_obj_t *card = lv_obj_create(scr);
+    lv_obj_set_size(card, w, 120);
+    lv_obj_set_pos(card, MARGIN, 80);
+    lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_CARD), 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *l = label(card, text, &lv_font_montserrat_28, 0xFFFFFF);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(l, 10, 0);
+    lv_obj_center(l);
+    secure_zero(text, sizeof(text));
+
+    l = label(scr,
+              "Write it down on paper and keep it\n"
+              "away from the board. It opens the\n"
+              "backup files saved with passkey.html:\n"
+              "you type it here when restoring.\n\n"
+              "The code and a backup file together\n"
+              "give access to all passwords.",
+              &lv_font_montserrat_16, COLOR_MUTED);
+    lv_obj_set_width(l, w);
+    lv_obj_set_pos(l, MARGIN, 220);
+    show(scr);
+}
+
 static void show_settings(void) {
     screen = SCR_SETTINGS;
     lv_obj_t *scr = new_screen();
@@ -432,19 +777,51 @@ static void show_settings(void) {
     lv_slider_set_value(s, brightness, LV_ANIM_OFF);
     lv_obj_add_event_cb(s, brightness_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    l = label(scr, "", &lv_font_montserrat_16, COLOR_MUTED);
-    lv_label_set_text_fmt(l,
-                          "Entries: %d of %d\n\n"
-                          "To add or change passwords, open\n"
-                          "passkey.html in Chrome or Edge\n"
-                          "on the computer.\n\n"
-                          "Switch the computer to the\n"
-                          "English (US) keyboard layout\n"
-                          "before typing.",
-                          vault_count(), VAULT_MAX_ENTRIES);
+    l = label(scr, "PROTECTION", &lv_font_montserrat_14, COLOR_MUTED);
+    lv_obj_set_pos(l, MARGIN, 172);
+    static const char *prot_map[] = {"Off", "PIN", ""};
+    lv_obj_t *bm = lv_btnmatrix_create(scr);
+    lv_btnmatrix_set_map(bm, prot_map);
+    lv_btnmatrix_set_btn_ctrl_all(bm, LV_BTNMATRIX_CTRL_CHECKABLE);
+    lv_btnmatrix_set_one_checked(bm, true);
+    lv_btnmatrix_set_btn_ctrl(bm, vault_lock_mode(), LV_BTNMATRIX_CTRL_CHECKED);
+    lv_obj_set_size(bm, w, 64);
+    lv_obj_set_pos(bm, MARGIN, 194);
+    lv_obj_set_style_pad_all(bm, 4, 0);
+    lv_obj_set_style_pad_gap(bm, 6, 0);
+    lv_obj_set_style_bg_color(bm, lv_color_hex(COLOR_CARD), 0);
+    lv_obj_set_style_border_width(bm, 0, 0);
+    lv_obj_set_style_radius(bm, 16, 0);
+    lv_obj_set_style_radius(bm, 12, LV_PART_ITEMS);
+    lv_obj_set_style_bg_opa(bm, LV_OPA_TRANSP, LV_PART_ITEMS);
+    lv_obj_set_style_bg_opa(bm, LV_OPA_COVER, LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(bm, lv_color_hex(COLOR_ACCENT), LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_text_font(bm, &lv_font_montserrat_20, LV_PART_ITEMS);
+    lv_obj_add_event_cb(bm, protection_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_coord_t y = 272;
+    if (vault_lock_mode() != LOCK_NONE) {
+        const int hw = (w - 12) / 2;
+        lv_obj_t *b = button(scr, "Change PIN", COLOR_CARD, hw, 56, change_secret_cb, NULL);
+        lv_obj_set_pos(b, MARGIN, y);
+        b = button(scr, "Backup code", COLOR_CARD, hw, 56, recovery_cb, NULL);
+        lv_obj_set_pos(b, MARGIN + hw + 12, y);
+    } else {
+        lv_obj_t *b = button(scr, "Backup recovery code", COLOR_CARD, w, 56, recovery_cb, NULL);
+        lv_obj_set_pos(b, MARGIN, y);
+    }
+    y += 70;
+
+    l = label(scr, "", &lv_font_montserrat_14, COLOR_MUTED);
+    if (vault_lock_mode() == LOCK_NONE)
+        lv_label_set_text_fmt(l, "Entries: %d of %d. Without protection\nthe passwords are stored unencrypted.",
+                              vault_count(), VAULT_MAX_ENTRIES);
+    else
+        lv_label_set_text_fmt(l, "Entries: %d of %d, encrypted. Locks after\n%d min idle; %d wrong tries erase all.",
+                              vault_count(), VAULT_MAX_ENTRIES, LOCK_AFTER_MS / 60000, VAULT_MAX_ATTEMPTS);
     lv_obj_set_width(l, w);
     lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
-    lv_obj_set_pos(l, MARGIN, 180);
+    lv_obj_set_pos(l, MARGIN, y);
 
     show(scr);
 }
@@ -473,8 +850,10 @@ static void tick_cb(lv_timer_t *t) {
         toast_show(editing ? LV_SYMBOL_EDIT "  Editor connected" : LV_SYMBOL_EDIT "  Editor closed", COLOR_CARD, 1500);
     }
 
-    // AMOLED: dim when idle to avoid burn-in.
     uint32_t idle = lv_disp_get_inactive_time(NULL);
+    if (vault_lock_mode() != LOCK_NONE && vault_is_unlocked() && idle > LOCK_AFTER_MS && !typing) lock_now();
+
+    // AMOLED: dim when idle to avoid burn-in.
     if (!dimmed && idle > DIM_AFTER_MS) {
         dimmed = true;
         AMOLED_1IN8_SetBrightness(DIM_BRIGHTNESS);
@@ -527,18 +906,29 @@ void ui_main(void) {
     lv_obj_add_flag(toast, LV_OBJ_FLAG_HIDDEN);
 
     vault_init();
-    show_list();
+    if (vault_is_unlocked()) show_list();
+    else show_unlock(NULL);
     lv_timer_create(tick_cb, 100, NULL);
 
     // Rebuilt shortly after the editor's last change, not once per entry during an import.
     absolute_time_t refresh_at = nil_time;
     while (true) {
         // Editor requests are handled here rather than in a timer so listing stays quick.
-        if (editor_service()) refresh_at = make_timeout_time_ms(300);
+        editor_set_state(!vault_is_unlocked(), vault_lock_mode());
+        editor_activity_t act = editor_service();
+        if (act != EDITOR_IDLE) lv_disp_trig_activity(NULL);   // editing counts as use: no auto-lock
+        if (act == EDITOR_CHANGED) refresh_at = make_timeout_time_ms(300);
+        // A backup was uploaded: ask for its code here on the board.
+        if (editor_restore_waiting() && vault_is_unlocked() && screen != SCR_RESTORE && !sec_busy) {
+            lv_disp_trig_activity(NULL);
+            show_pin_screen(PURPOSE_RESTORE, NULL);
+        }
         if (!is_nil_time(refresh_at) && time_reached(refresh_at)) {
             refresh_at = nil_time;
             list_scroll = 0;
-            if (screen != SCR_SETTINGS) show_list();
+            // A wipe from the editor also clears the lock, so the lock screen can go too.
+            if (screen == SCR_LIST || screen == SCR_DETAIL || (screen == SCR_LOCK && vault_is_unlocked())) show_list();
+            else if (screen == SCR_SETTINGS) show_settings();
         }
         lv_timer_handler();
         sleep_ms(2);

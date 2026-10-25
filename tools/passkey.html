@@ -89,6 +89,11 @@
   </div>
 
   <div id="app" class="hidden">
+    <div class="card warn hidden" id="lockedBanner">
+      <b>Плата заблокирована.</b> Введите PIN на экране платы. Страница подождёт
+      и сама покажет записи.
+    </div>
+    <div id="editor">
     <div class="card">
       <h2>Новая запись</h2>
       <div class="grid">
@@ -143,9 +148,29 @@
     </div>
 
     <div class="card">
+      <h2>Резервная копия</h2>
+      <p class="note" style="margin-top:0">Файл копии зашифрован <b>кодом восстановления</b> из 24 цифр. Код хранится только
+        на плате: <b>Settings → Backup code</b>. Запишите его на бумаге и храните отдельно от платы. Без кода файл
+        бесполезен, а код никогда не передаётся на компьютер.</p>
+      <div class="row-actions">
+        <button class="primary" id="backupBtn">Скачать копию</button>
+      </div>
+      <div class="row-actions">
+        <input type="file" id="restoreFile" accept=".pkb">
+        <label class="check"><input type="checkbox" id="restoreReplace"> Заменить текущий список</label>
+        <span class="spacer"></span>
+        <button id="restoreBtn" disabled>Восстановить</button>
+      </div>
+      <p class="note" id="restoreInfo">При восстановлении код вводится на экране платы. Без галочки записи из копии
+        добавляются к текущим, совпадающие (то же название и логин) пропускаются.</p>
+    </div>
+
+    </div>
+    <div class="card">
       <h2>Опасная зона</h2>
       <div class="row-actions" style="margin-top:0">
-        <span class="note">Удалить все записи с платы. Отменить нельзя.</span>
+        <span class="note">Удалить все записи и снять защиту. Работает и на заблокированной плате,
+          если забыт PIN. Отменить нельзя.</span>
         <span class="spacer"></span>
         <button class="danger" id="wipeBtn">Стереть всё</button>
       </div>
@@ -242,10 +267,6 @@ const dev = {
 async function connect(port) {
   try {
     await dev.open(port);
-    const hello = await dev.cmd(['HELLO'], 3000);
-    const parts = hello.reply.split(' ');
-    if (parts[0] !== 'PassKey') throw new Error('это не Pass Key');
-    maxEntries = parseInt(parts[2], 10) || maxEntries;
     setConnected(true);
     await refresh();
   } catch (e) {
@@ -261,12 +282,41 @@ function onDisconnected() {
   toast('Плата отключена', true);
 }
 
+const MODE_NAMES = { none: 'без защиты', pin: 'защита PIN' };
+let lockPoll = null;
+
+// HELLO -> {locked, mode}. Older firmware answers without the last two fields.
+async function hello(timeoutMs = 3000) {
+  const parts = (await dev.cmd(['HELLO'], timeoutMs)).reply.split(' ');
+  if (parts[0] !== 'PassKey') throw new Error('это не Pass Key');
+  maxEntries = parseInt(parts[2], 10) || maxEntries;
+  const info = { locked: parts[3] === 'locked', mode: parts[4] || 'none' };
+  $('statusText').textContent = 'Подключено · ' + (MODE_NAMES[info.mode] || info.mode);
+  return info;
+}
+
+// While locked, keep asking the board until it's unlocked on screen.
+function setLocked(locked) {
+  $('lockedBanner').classList.toggle('hidden', !locked);
+  $('editor').classList.toggle('hidden', locked);
+  clearInterval(lockPoll);
+  lockPoll = null;
+  if (!locked) return;
+  lockPoll = setInterval(async () => {
+    try {
+      const info = await hello(2000);
+      if (!info.locked) { setLocked(false); await refresh(); }
+    } catch (e) { /* board busy or gone; the disconnect handler deals with the latter */ }
+  }, 1500);
+}
+
 function setConnected(on) {
   $('dot').classList.toggle('on', on);
   $('statusText').textContent = on ? 'Подключено' : 'Не подключено';
   $('connectBtn').classList.toggle('hidden', on);
   $('disconnectBtn').classList.toggle('hidden', !on);
   $('app').classList.toggle('hidden', !on);
+  if (!on) setLocked(false);
 }
 
 // ---------------------------------------------------------------- data
@@ -278,6 +328,7 @@ function check(value, max, what) {
 }
 
 async function refresh() {
+  if ((await hello()).locked) return setLocked(true);
   const r = await dev.cmd(['LIST']);
   entries = r.data.filter(l => l.startsWith('E\t')).map(l => {
     const f = l.split('\t');
@@ -367,7 +418,10 @@ function generate() {
 async function busy(button, fn) {
   button.disabled = true;
   try { await fn(); }
-  catch (e) { toast('Ошибка: ' + e.message, true); }
+  catch (e) {
+    if (e.message === 'locked') { setLocked(true); toast('Плата заблокирована: разблокируйте её на экране', true); }
+    else toast('Ошибка: ' + e.message, true);
+  }
   finally { button.disabled = false; }
 }
 
@@ -494,6 +548,68 @@ $('addBtn').onclick = () => busy($('addBtn'), async () => {
   $('newPass').type = 'password';
   toast('Добавлено');
   await refresh();
+});
+
+// ---------------------------------------------------------------- backup
+
+const BACKUP_CHUNK = 96;   // bytes per R line, as the board sends them
+
+function toBase64(bytes) {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+$('backupBtn').onclick = () => busy($('backupBtn'), async () => {
+  const r = await dev.cmd(['BACKUP'], 20000);
+  const bin = r.data.filter(l => l.startsWith('B\t')).map(l => atob(l.slice(2))).join('');
+  if (bin.length !== parseInt(r.reply, 10)) throw new Error('копия пришла не полностью');
+  const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+  const a = el('a', {
+    href: URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' })),
+    download: `passkey-backup-${new Date().toISOString().slice(0, 10)}.pkb`,
+  });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  toast(`Копия сохранена, записей: ${entries.length}`);
+});
+
+$('restoreFile').onchange = () => { $('restoreBtn').disabled = !$('restoreFile').files[0]; };
+
+$('restoreBtn').onclick = () => busy($('restoreBtn'), async () => {
+  const bytes = new Uint8Array(await $('restoreFile').files[0].arrayBuffer());
+  if (bytes.length < 72 || String.fromCharCode(...bytes.slice(0, 4)) !== 'PKB1')
+    return toast('Это не файл копии Pass Key', true);
+  const replace = $('restoreReplace').checked;
+  if (replace && !confirm('Заменить все записи на плате записями из копии?')) return;
+
+  await dev.cmd(['RESTORE', bytes.length]);
+  for (let i = 0; i < bytes.length; i += BACKUP_CHUNK) {
+    await dev.cmd(['R', toBase64(bytes.slice(i, i + BACKUP_CHUNK))]);
+    $('restoreInfo').textContent = `Передача: ${Math.min(100, Math.round((i + BACKUP_CHUNK) * 100 / bytes.length))}%`;
+  }
+  const end = await dev.cmd(['RESTORE_END', replace ? 'replace' : 'merge']);
+  $('restoreInfo').textContent = `Записей в копии: ${end.reply}. Введите код восстановления на экране платы…`;
+  toast('Введите код восстановления на экране платы');
+
+  // The code is typed on the board; wait for it (up to 10 minutes).
+  for (let t = 0; t < 600; t++) {
+    await new Promise(r => setTimeout(r, 1000));
+    const st = (await dev.cmd(['RESTORE_STATUS'])).reply.split(' ');
+    if (st[0] === 'waiting') continue;
+    if (st[0] === 'done') {
+      $('restoreInfo').textContent = `Восстановлено: ${st[1]}, пропущено: ${st[2]}.`;
+      toast('Копия восстановлена');
+      $('restoreFile').value = '';
+      $('restoreBtn').disabled = true;
+      return refresh();
+    }
+    $('restoreInfo').textContent = st[0] === 'cancelled' ? 'Восстановление отменено на плате.' : 'Не удалось восстановить копию.';
+    return;
+  }
+  $('restoreInfo').textContent = 'Код так и не ввели. Можно попробовать снова.';
 });
 
 $('wipeBtn').onclick = () => busy($('wipeBtn'), async () => {
