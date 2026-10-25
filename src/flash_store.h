@@ -9,6 +9,7 @@
 //   0x000000  firmware, at most FIRMWARE_MAX_SIZE
 //   0x180000  pico-fido data (credentials, FIDO settings), 2 MB
 //   0x380000  free
+//   end-52K   FIDO passkey dates and use counts, 2 sectors
 //   end-44K   FIDO master key, 1 sector
 //   end-40K   hotkeys, 1 sector
 //   end-36K   vault: attempt counter, 1 sector | slot 0, 16 KB | slot 1, 16 KB
@@ -23,6 +24,8 @@
 #define VAULT_FLASH_OFFSET     (PICO_FLASH_SIZE_BYTES - VAULT_FLASH_SIZE)
 #define HOTKEYS_FLASH_OFFSET   (VAULT_FLASH_OFFSET - FLASH_SECTOR_SIZE)
 #define FIDO_KEY_FLASH_OFFSET  (HOTKEYS_FLASH_OFFSET - FLASH_SECTOR_SIZE)
+#define FIDO_USE_FLASH_SIZE    (2 * FLASH_SECTOR_SIZE)
+#define FIDO_USE_FLASH_OFFSET  (FIDO_KEY_FLASH_OFFSET - FIDO_USE_FLASH_SIZE)
 
 // Memory-mapped read access to a flash offset.
 const uint8_t *flash_ptr(uint32_t offset);

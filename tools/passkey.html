@@ -64,6 +64,14 @@
   #toast.show { opacity: 1; }
   #toast.err { background: var(--danger); color: #fff; }
   .hidden { display: none !important; }
+  .stats { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .stat { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; min-width: 120px; }
+  .stat b { display: block; font-size: 18px; }
+  .stat span { font-size: 12px; color: var(--muted); }
+  .stat.bad b { color: var(--danger); }
+  td .site { font-weight: 600; }
+  td .sub { font-size: 13px; color: var(--muted); }
+  td.num { white-space: nowrap; }
   .empty { text-align: center; padding: 28px 0; color: var(--muted); }
   @media (max-width: 720px) {
     .grid { grid-template-columns: 1fr; }
@@ -72,6 +80,8 @@
     tr { border-top: 1px solid var(--line); padding: 10px 0; }
     td { border: 0; padding: 4px 0; }
     td.act { text-align: left; }
+    td.num { white-space: normal; }
+    td[data-label]::before { content: attr(data-label) ": "; color: var(--muted); }
   }
 </style>
 </head>
@@ -189,6 +199,36 @@
         <button class="primary" id="keySave" disabled>Сохранить на плату</button>
       </div>
     </div>
+    <div class="card hidden" id="fidoCard">
+      <h2>Аппаратный ключ (FIDO2 / passkeys)</h2>
+      <div class="stats">
+        <div class="stat" id="fidoPinStat"><b id="fidoPin">—</b><span>PIN ключа</span></div>
+        <div class="stat"><b id="fidoCount">—</b><span>passkeys на ключе</span></div>
+        <div class="stat"><b id="fidoClock">—</b><span>часы платы</span></div>
+      </div>
+      <div class="row-actions" style="margin-top:0" id="fidoUnlockRow">
+        <label class="field" style="flex:1;min-width:200px"><span>PIN ключа FIDO</span>
+          <input type="password" id="fidoPinInput" class="any" maxlength="63" autocomplete="off" placeholder="тот, что задавали в браузере"></label>
+        <button class="primary" id="fidoShowBtn" style="align-self:flex-end">Показать passkeys</button>
+      </div>
+      <p class="note" id="fidoNote">Список хранится на ключе в зашифрованном виде, поэтому нужен PIN. Каждая неверная
+        попытка расходует одну из 8, как в браузере.</p>
+      <div id="fidoListBox" class="hidden">
+        <table>
+          <thead><tr><th>Сайт и пользователь</th><th>Создан</th><th>Последний вход</th><th>Входов</th><th></th></tr></thead>
+          <tbody id="fidoRows"></tbody>
+        </table>
+        <div class="empty hidden" id="fidoEmpty">На ключе нет passkeys.</div>
+        <div class="row-actions">
+          <span class="note">Даты известны, только если плата знала время: страница сообщает его при подключении.
+            Входы после включения платы получают дату, когда страница откроется, если плату не выключали.
+            Удалённый здесь passkey останется в настройках сайта: уберите его и там.</span>
+          <span class="spacer"></span>
+          <button id="fidoRefreshBtn">Обновить</button>
+          <button id="fidoForgetBtn">Скрыть</button>
+        </div>
+      </div>
+    </div>
     <div class="card">
       <h2>Опасная зона</h2>
       <div class="row-actions" style="margin-top:0">
@@ -294,6 +334,7 @@ async function connect(port) {
     setConnected(true);
     await refresh();
     await loadKeys();
+    await loadFido();
   } catch (e) {
     toast('Не удалось подключиться: ' + e.message, true);
     await dev.close();
@@ -302,6 +343,7 @@ async function connect(port) {
 }
 
 function onDisconnected() {
+  fidoForget();
   dev.close();
   setConnected(false);
   toast('Плата отключена', true);
@@ -374,7 +416,9 @@ function render() {
 
 function el(tag, props = {}, children = []) {
   const n = document.createElement(tag);
-  Object.assign(n, props);
+  const { dataset, ...rest } = props;
+  Object.assign(n, rest);
+  if (dataset) Object.assign(n.dataset, dataset);
   for (const c of children) n.append(c);
   return n;
 }
@@ -776,9 +820,133 @@ $('wipeBtn').onclick = () => busy($('wipeBtn'), async () => {
 // Live validation: red outline on fields the board can't store.
 document.addEventListener('input', ev => {
   const t = ev.target;
-  if (t.tagName === 'INPUT' && (t.type === 'text' || t.type === 'password'))
+  if (t.tagName === 'INPUT' && (t.type === 'text' || t.type === 'password') && !t.classList.contains('any'))
     t.classList.toggle('bad', !/^[\x20-\x7E]*$/.test(t.value));
 });
+
+// ---------------------------------------------------------------- FIDO passkeys
+
+let fidoPin = null;      // kept only while the list is shown, for deleting
+let passkeys = [];       // {slot, id, rp, user, display, created, lastUsed, uses, alg, credProtect}
+
+const PIN_ERRORS = {
+  49: n => `Неверный PIN. Осталось попыток: ${n}`,
+  50: () => 'PIN заблокирован после 8 неверных попыток. Ключ FIDO придётся сбросить в браузере.',
+  52: () => 'Три неверных PIN подряд. Выньте плату из USB и вставьте снова, потом повторите.',
+  53: () => 'PIN ключа ещё не задан: браузер попросит его при первой регистрации passkey.',
+};
+
+// "pin 49 7" from the board -> readable text; anything else unchanged.
+function fidoError(msg) {
+  const m = /^pin (\d+) (\d+)$/.exec(msg);
+  if (m && PIN_ERRORS[m[1]]) return PIN_ERRORS[m[1]](m[2]);
+  if (msg === 'busy') return 'Ключ занят запросом браузера. Повторите через пару секунд.';
+  if (msg === 'no such passkey') return 'Такого passkey уже нет. Обновите список.';
+  return msg;
+}
+
+function hexUtf8(s) {
+  return [...new TextEncoder().encode(s)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function fmtDate(t) {
+  if (!t) return '—';
+  const d = new Date(t * 1000);
+  const days = Math.floor((Date.now() - d) / 86400000);
+  const rel = days <= 0 ? 'сегодня' : days === 1 ? 'вчера' : days < 30 ? `${days} дн. назад` : '';
+  const abs = d.toLocaleString('ru-RU', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  return rel ? `${abs} (${rel})` : abs;
+}
+
+const ALG_NAMES = { '-7': 'ES256', '-8': 'Ed25519', '-35': 'ES384', '-36': 'ES512', '-47': 'ES256K' };
+
+async function loadFido() {
+  let info;
+  try {
+    // The board has no clock; tell it the time so passkey dates can be recorded.
+    await dev.cmd(['TIME', Math.floor(Date.now() / 1000)]);
+    info = (await dev.cmd(['FIDO_INFO'])).reply.split(' ').map(Number);
+  } catch (e) {
+    $('fidoCard').classList.add('hidden');   // firmware without FIDO management
+    return;
+  }
+  const [pinSet, retries, count, max, clock] = info;
+  $('fidoCard').classList.remove('hidden');
+  $('fidoPin').textContent = pinSet ? `задан · попыток ${retries}` : 'не задан';
+  $('fidoPinStat').classList.toggle('bad', pinSet && retries < 8);
+  $('fidoCount').textContent = `${count} из ${max}`;
+  $('fidoClock').textContent = clock ? 'установлены' : 'неизвестно';
+  $('fidoUnlockRow').classList.toggle('hidden', !pinSet || fidoPin !== null);
+  $('fidoNote').classList.toggle('hidden', fidoPin !== null);
+  if (!pinSet) {
+    $('fidoNote').classList.remove('hidden');
+    $('fidoNote').textContent = 'PIN ключа ещё не задан. Браузер попросит его при первой регистрации passkey; ' +
+      'после этого здесь можно будет посмотреть и удалить passkeys.';
+  }
+}
+
+async function listFido(pin) {
+  const r = await dev.cmd(['FIDO_LIST', hexUtf8(pin)], 20000);
+  passkeys = r.data.filter(l => l.startsWith('P\t')).map(l => {
+    const f = l.split('\t');
+    return { slot: +f[1], id: f[2], rp: f[3], user: f[4], display: f[5], created: +f[6], lastUsed: +f[7],
+             uses: +f[8], alg: f[9], credProtect: +f[10] };
+  });
+  passkeys.sort((a, b) => (b.lastUsed || b.created) - (a.lastUsed || a.created) || a.rp.localeCompare(b.rp));
+  fidoPin = pin;
+  renderFido();
+  await loadFido();
+}
+
+function renderFido() {
+  $('fidoListBox').classList.remove('hidden');
+  const tbody = $('fidoRows');
+  tbody.textContent = '';
+  $('fidoEmpty').classList.toggle('hidden', passkeys.length > 0);
+  for (const p of passkeys) {
+    const who = p.display && p.display !== p.user ? `${p.user} · ${p.display}` : (p.user || '(без имени)');
+    const detail = `Алгоритм ${ALG_NAMES[p.alg] || p.alg}, credProtect ${p.credProtect || 1}, слот ${p.slot}, ID ${p.id || '—'}`;
+    const del = el('button', { className: 'danger', textContent: 'Удалить' });
+    del.onclick = () => busy(del, () => deleteFido(p));
+    tbody.append(el('tr', { title: detail }, [
+      el('td', {}, [el('div', { className: 'site', textContent: p.rp }), el('div', { className: 'sub', textContent: who })]),
+      el('td', { className: 'num', textContent: fmtDate(p.created), dataset: { label: 'Создан' } }),
+      el('td', { className: 'num', textContent: fmtDate(p.lastUsed), dataset: { label: 'Последний вход' } }),
+      el('td', { className: 'num', textContent: String(p.uses), dataset: { label: 'Входов' } }),
+      el('td', { className: 'act' }, [del]),
+    ]));
+  }
+}
+
+async function deleteFido(p) {
+  if (!confirm(`Удалить passkey для ${p.rp}${p.user ? ' (' + p.user + ')' : ''}?\n\n` +
+               'Войти на сайт этим ключом больше не получится. Отменить нельзя.')) return;
+  try { await dev.cmd(['FIDO_DEL', hexUtf8(fidoPin), p.slot, p.id], 15000); }
+  catch (e) { throw new Error(fidoError(e.message)); }
+  toast('Passkey удалён');
+  await listFido(fidoPin);
+}
+
+function fidoForget() {
+  fidoPin = null;
+  passkeys = [];
+  $('fidoRows').textContent = '';
+  $('fidoListBox').classList.add('hidden');
+  $('fidoPinInput').value = '';
+}
+
+$('fidoShowBtn').onclick = () => busy($('fidoShowBtn'), async () => {
+  const pin = $('fidoPinInput').value;
+  if (pin.length < 4) throw new Error('PIN ключа — не короче 4 символов');
+  try { await listFido(pin); }
+  catch (e) { await loadFido().catch(() => {}); throw new Error(fidoError(e.message)); }
+  $('fidoPinInput').value = '';
+});
+$('fidoPinInput').addEventListener('keydown', ev => { if (ev.key === 'Enter') $('fidoShowBtn').click(); });
+$('fidoRefreshBtn').onclick = () => busy($('fidoRefreshBtn'), async () => {
+  try { await listFido(fidoPin); } catch (e) { throw new Error(fidoError(e.message)); }
+});
+$('fidoForgetBtn').onclick = async () => { fidoForget(); await loadFido().catch(() => {}); };
 
 if (!('serial' in navigator)) {
   $('unsupported').classList.remove('hidden');
@@ -790,7 +958,7 @@ if (!('serial' in navigator)) {
     catch (e) { return; }   // user closed the picker
     await connect(port);
   };
-  $('disconnectBtn').onclick = async () => { await dev.close(); setConnected(false); };
+  $('disconnectBtn').onclick = async () => { fidoForget(); await dev.close(); setConnected(false); };
 
   // Reconnect on its own to a board that was already allowed once.
   const autoConnect = async () => {

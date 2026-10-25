@@ -85,7 +85,7 @@ index f7ca1c9..22b2f85 100644
  extern void button_task(void);
  extern volatile bool cancel_button;
 diff --git a/src/fs/low_flash.c b/src/fs/low_flash.c
-index 5ac7185..1e7a468 100644
+index 5ac7185..1a88de9 100644
 --- a/src/fs/low_flash.c
 +++ b/src/fs/low_flash.c
 @@ -566,7 +566,11 @@ void low_flash_init(void) {
@@ -101,6 +101,35 @@ index 5ac7185..1e7a468 100644
      __attribute__((aligned(4))) uint32_t workarea[1024];
      int rc = rom_load_partition_table((uint8_t *)workarea, sizeof(workarea), false);
      if (rc) {
+@@ -628,13 +632,6 @@ static bool low_flash_available(void) {
+ }
+ 
+ bool low_flash_commit_sync(uint32_t timeout_ms) {
+-#if defined(PICO_PLATFORM)
+-    // Core 0 owns low_flash_task(). Waiting for it from core 0 would prevent
+-    // the queued flash operation from ever being serviced.
+-    if (get_core_num() != 1) {
+-        return false;
+-    }
+-#endif
+     low_flash_commit();
+ 
+     uint32_t start = board_millis();
+@@ -646,7 +643,13 @@ bool low_flash_commit_sync(uint32_t timeout_ms) {
+         // APDU handling and flash_task() share the emulation event loop, so waiting here without draining the queue can never make progress.
+         low_flash_task();
+ #elif defined(PICO_PLATFORM)
+-        tight_loop_contents();
++        // Core 0 owns low_flash_task(): there, service the queue instead of waiting for it.
++        if (get_core_num() == 0) {
++            low_flash_task();
++        }
++        else {
++            tight_loop_contents();
++        }
+ #elif defined(ESP_PLATFORM)
+         vTaskDelay(1);
+ #endif
 diff --git a/src/led/led.c b/src/led/led.c
 index 145cafb..43eba9c 100644
 --- a/src/led/led.c

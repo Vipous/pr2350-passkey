@@ -1,5 +1,85 @@
+diff --git a/src/fido/cbor_client_pin.c b/src/fido/cbor_client_pin.c
+index c26f392..f3cd508 100644
+--- a/src/fido/cbor_client_pin.c
++++ b/src/fido/cbor_client_pin.c
+@@ -954,3 +954,75 @@ err:
+     res_APDU_size = (uint16_t)resp_size;
+     return 0;
+ }
++
++// Pass Key: its management page sends the FIDO PIN over the board's serial port to list and delete
++// passkeys. The same checks and retry counting as getPinUvAuthToken, without the key agreement;
++// on success the device key is unlocked as after a PIN entered in a browser.
++int fido_pin_check(const uint8_t *pin, size_t pin_len, uint8_t *retries_left) {
++    *retries_left = 0;
++    if (!file_has_data(ef_pin)) {
++        return CTAP2_ERR_PIN_NOT_SET;
++    }
++    uint8_t pin_data[PIN_DATA_LEN];
++    uint16_t pin_data_len = 0;
++    if (!load_pin_data(ef_pin, pin_data, &pin_data_len)) {
++        return CTAP2_ERR_PROCESSING;
++    }
++    if ((pin_data[0] & PIN_RETRY_COUNT_MASK) == 0) {
++        return CTAP2_ERR_PIN_BLOCKED;
++    }
++    pin_data[0] = (uint8_t)((pin_data[0] & PIN_RETRY_POWER_CYCLE) | ((pin_data[0] & PIN_RETRY_COUNT_MASK) - 1));
++    if (!persist_pin_retry_counter(ef_pin, pin_data, pin_data_len)) {
++        return CTAP2_ERR_PROCESSING;
++    }
++    uint8_t retries = pin_data[0] & PIN_RETRY_COUNT_MASK;
++    bool power_cycle_locked = (pin_data[0] & PIN_RETRY_POWER_CYCLE) != 0;
++    uint8_t pin_hash[32], dhash[32], off = 3;
++    mbedtls_sha256(pin, pin_len, pin_hash, 0);   // the browser sends LEFT(SHA-256(PIN), 16)
++    if (pin_data_len == PIN_LEGACY_DATA_LEN) {
++        off = 2;
++        double_hash_pin(CONST_BYTE_ARRAY(pin_hash, 16), dhash);
++    }
++    else {
++        pin_derive_verifier(CONST_BYTE_ARRAY(pin_hash, 16), dhash);
++    }
++    if (mbedtls_ct_memcmp(dhash, pin_data + off, 32) != 0) {
++        mbedtls_platform_zeroize(pin_hash, sizeof(pin_hash));
++        mbedtls_platform_zeroize(dhash, sizeof(dhash));
++        *retries_left = retries;
++        if (retries == 0) {
++            return CTAP2_ERR_PIN_BLOCKED;
++        }
++        if (power_cycle_locked || ++new_pin_mismatches >= 3) {
++            if (!power_cycle_locked) {
++                pin_data[0] |= PIN_RETRY_POWER_CYCLE;
++                persist_pin_retry_counter(ef_pin, pin_data, pin_data_len);
++            }
++            needs_power_cycle = true;
++            return CTAP2_ERR_PIN_AUTH_BLOCKED;
++        }
++        return CTAP2_ERR_PIN_INVALID;
++    }
++    mbedtls_platform_zeroize(dhash, sizeof(dhash));
++    if (needs_power_cycle) {
++        mbedtls_platform_zeroize(pin_hash, sizeof(pin_hash));
++        return CTAP2_ERR_PIN_AUTH_BLOCKED;
++    }
++    if (off == 2) {   // a PIN from before pico-fido's current format: let a browser upgrade it
++        mbedtls_platform_zeroize(pin_hash, sizeof(pin_hash));
++        return CTAP2_ERR_PROCESSING;
++    }
++    pin_derive_session(CONST_BYTE_ARRAY(pin_hash, 16), session_pin);
++    mbedtls_platform_zeroize(pin_hash, sizeof(pin_hash));
++    int ret = check_keydev_encrypted(session_pin);
++    if (ret != PICOKEYS_OK) {
++        return ret;
++    }
++    pin_data[0] = MAX_PIN_RETRIES;
++    new_pin_mismatches = 0;
++    file_put_data(ef_pin, CONST_BYTE_ARRAY(pin_data, sizeof(pin_data)));
++    mbedtls_platform_zeroize(pin_data, sizeof(pin_data));
++    flash_commit();
++    *retries_left = MAX_PIN_RETRIES;
++    return 0;
++}
 diff --git a/src/fido/cbor_get_assertion.c b/src/fido/cbor_get_assertion.c
-index 7caa61a..ad3e23c 100644
+index 7caa61a..37629e5 100644
 --- a/src/fido/cbor_get_assertion.c
 +++ b/src/fido/cbor_get_assertion.c
 @@ -537,6 +537,9 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
@@ -12,8 +92,18 @@ index 7caa61a..ad3e23c 100644
  
          if (options.up == ptrue || options.present == false || options.up == NULL) { //9.1
              if (pinUvAuthParam.present == true) {
+@@ -900,6 +903,9 @@ err:
+         }
+         event_send(OP_GA, error == CborNoError ? RC_OK : RC_ERROR, event_fields, event_fields_len);
+     }
++    if (error == CborNoError && selcred && selcred->residentId.present && selcred->residentId.len == CRED_RESIDENT_LEN) {
++        fido_credential_event(false, selcred->residentId.data);
++    }
+     current_fido_operation = OP_NONE;
+     rp_id = NULL;
+     rp_id_len = 0;
 diff --git a/src/fido/cbor_make_credential.c b/src/fido/cbor_make_credential.c
-index 589acf4..0b37f57 100644
+index 589acf4..375d7c3 100644
 --- a/src/fido/cbor_make_credential.c
 +++ b/src/fido/cbor_make_credential.c
 @@ -543,6 +543,11 @@ int cbor_make_credential(const uint8_t *data, size_t len) {
@@ -28,6 +118,41 @@ index 589acf4..0b37f57 100644
          flags |= FIDO2_AUT_FLAG_UP;
          clearUserPresentFlag();
          clearUserVerifiedFlag();
+@@ -857,6 +862,7 @@ int cbor_make_credential(const uint8_t *data, size_t len) {
+             CBOR_ERROR(CTAP2_ERR_KEY_STORE_FULL);
+         }
+         dev_state_update(DEV_STATE_CRED_STATE);
++        fido_credential_event(true, cred_idr);
+     }
+     flash_commit();
+ err:
+diff --git a/src/fido/credential.c b/src/fido/credential.c
+index e32f98d..68aeeaf 100644
+--- a/src/fido/credential.c
++++ b/src/fido/credential.c
+@@ -1278,3 +1278,10 @@ int credential_resident_verify(const file_t *ef, const uint8_t rp_id_hash[RP_ID_
+     }
+     return ret;
+ }
++
++// Pass Key: called on core 1 when a passkey stored on the key is created or used for a sign-in,
++// with its resident ID. The firmware records when; this default does nothing.
++__attribute__((weak)) void fido_credential_event(bool created, const uint8_t *resident_id) {
++    (void)created;
++    (void)resident_id;
++}
+diff --git a/src/fido/credential.h b/src/fido/credential.h
+index bf296e9..2e9767a 100644
+--- a/src/fido/credential.h
++++ b/src/fido/credential.h
+@@ -156,6 +156,7 @@ extern int credential_migrate_rp_secure(void);
+ extern int credential_rp_count(uint16_t *count);
+ extern int credential_rp_load(uint16_t index, CredentialRp *rp);
+ extern void credential_rp_free(CredentialRp *rp);
++extern void fido_credential_event(bool created, const uint8_t *resident_id);
+ extern int credential_rp_legacy_decrement(const uint8_t rp_id_hash[RP_ID_HASH_LEN]);
+ 
+ #endif // _CREDENTIAL_H_
 diff --git a/src/fido/fido.c b/src/fido/fido.c
 index 93120fd..e4e1f98 100644
 --- a/src/fido/fido.c

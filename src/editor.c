@@ -7,12 +7,13 @@
 
 #include "backup.h"
 #include "fido_glue.h"
+#include "fido_manage.h"
 #include "hardware/sync.h"
 #include "hotkeys.h"
 #include "tusb.h"
 #include "pass_vault.h"
 
-#define PROTOCOL_VERSION 4
+#define PROTOCOL_VERSION 5
 #define LINE_MAX 320
 #define MAX_FIELDS 6
 
@@ -179,8 +180,9 @@ static size_t out_len, out_pos;
 
 static volatile bool connected;
 
-typedef enum { ST_READ, ST_WAIT, ST_LIST, ST_BACKUP } state_t;
+typedef enum { ST_READ, ST_WAIT, ST_LIST, ST_BACKUP, ST_FIDO_LIST } state_t;
 static state_t state = ST_READ;
+static int fido_slot, fido_listed;
 static op_t waiting_op;
 static int list_index;
 static size_t backup_pos;
@@ -273,6 +275,33 @@ static const char *fill_entry(char **f, int n) {
     if (n > 3) strcpy(req.entry.pass, f[3]);
     req.keep_pass = n <= 3;
     return NULL;
+}
+
+// FIDO PIN sent as hex (it may contain any UTF-8); false if malformed.
+static bool unhex_pin(const char *hex, char pin[64]) {
+    size_t n = strlen(hex);
+    if (n == 0 || n % 2 || n / 2 > 63) return false;
+    for (size_t i = 0; i < n / 2; i++) {
+        unsigned v;
+        if (sscanf(hex + 2 * i, "%2x", &v) != 1) return false;
+        pin[i] = (char)v;
+    }
+    pin[n / 2] = 0;
+    return strlen(pin) == n / 2;
+}
+
+// Checks the PIN for FIDO_LIST / FIDO_DEL; on failure replies "ERR pin <ctap code> <retries left>".
+static bool fido_unlock_or_reply(const char *hex) {
+    char pin[64];
+    if (!unhex_pin(hex, pin)) {
+        reply("ERR bad pin\n");
+        return false;
+    }
+    uint8_t retries = 0;
+    int r = fido_manage_unlock(pin, &retries);
+    memset(pin, 0, sizeof(pin));
+    if (r != 0) reply("ERR pin %d %d\n", r, retries);
+    return r == 0;
 }
 
 static void handle_line(char *s) {
@@ -415,6 +444,38 @@ static void handle_line(char *s) {
         fido_log_clear();
         reply("OK\n");
         return;
+    } else if (strcmp(cmd, "TIME") == 0) {
+        // TIME <unix seconds>: the board has no clock; the page tells it, for passkey dates.
+        long long t = n > 1 ? atoll(f[1]) : 0;
+        if (t < 1600000000LL || t > 0xFFFFFFFFLL) reply("ERR bad time\n");
+        else {
+            fido_manage_set_time((uint32_t)t);
+            reply("OK\n");
+        }
+        return;
+    } else if (strcmp(cmd, "FIDO_INFO") == 0) {
+        // -> OK <PIN set 0/1> <PIN attempts left> <passkeys> <room for> <clock set 0/1>
+        fido_info_t info;
+        fido_manage_info(&info);
+        reply("OK %d %d %d %d %d\n", info.pin_set, info.retries, info.count, info.max, fido_manage_has_time());
+        return;
+    } else if (strcmp(cmd, "FIDO_LIST") == 0) {
+        // FIDO_LIST <PIN hex> -> P lines (see editor_task), then "OK <count>"
+        if (fido_manage_busy()) reply("ERR busy\n");
+        else if (n > 1 && fido_unlock_or_reply(f[1])) {
+            fido_slot = fido_listed = 0;
+            state = ST_FIDO_LIST;
+        } else if (n <= 1) reply("ERR bad pin\n");
+        return;
+    } else if (strcmp(cmd, "FIDO_DEL") == 0) {
+        // FIDO_DEL <PIN hex> <slot> <id>
+        if (n < 4) reply("ERR missing fields\n");
+        else if (fido_manage_busy()) reply("ERR busy\n");
+        else if (fido_unlock_or_reply(f[1])) {
+            int r = fido_manage_delete(atoi(f[2]), f[3]);
+            reply(r == 0 ? "OK\n" : r == -1 ? "ERR no such passkey\n" : "ERR flash write failed\n");
+        }
+        return;
     } else if (strcmp(cmd, "RESTORE_STATUS") == 0) {
         switch (restore_state) {
         case RS_WAITING: reply("OK waiting\n"); break;
@@ -479,6 +540,25 @@ void editor_task(void) {
             reply(req.result == -3 ? "ERR locked\n" : "OK\n");
             req.state = REQ_IDLE;
             state = ST_READ;
+        }
+        return;
+    }
+
+    if (state == ST_FIDO_LIST) {
+        // P <slot> <id> <site> <user name> <display name> <created> <last used> <uses> <alg> <credProtect>
+        // (dates in Unix time, 0 = unknown). A passkey at a time, as the serial buffer drains,
+        // pausing while a browser request runs.
+        static fido_passkey_t pk;
+        while (out_len < sizeof(out) / 2 && !fido_manage_busy()) {
+            if (!fido_manage_next(&fido_slot, &pk)) {
+                reply("OK %d\n", fido_listed);
+                state = ST_READ;
+                break;
+            }
+            reply("P\t%d\t%s\t%s\t%s\t%s\t%lu\t%lu\t%lu\t%ld\t%d\n", pk.slot, pk.id, pk.rp, pk.user, pk.display,
+                  (unsigned long)pk.created, (unsigned long)pk.last_used, (unsigned long)pk.uses, (long)pk.alg,
+                  pk.cred_protect);
+            fido_listed++;
         }
         return;
     }

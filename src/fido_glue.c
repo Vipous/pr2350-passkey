@@ -1,4 +1,5 @@
 #include "fido_glue.h"
+#include "fido_manage.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -260,6 +261,7 @@ void fido_start(void) {
     signal_add(SIGNAL_USER_PRESENCE_TIMEOUT, SIGNAL_FLAG_NONE, on_presence);
 
     picokey_init();      // registers the FIDO application
+    fido_manage_init();
 }
 
 void fido_poll(void) {
@@ -271,4 +273,6 @@ void fido_poll(void) {
     flash_task();
     fido_log_stage(44);
     button_task();
+    fido_log_stage(45);
+    fido_manage_task();
 }
