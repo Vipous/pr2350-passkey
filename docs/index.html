@@ -1,0 +1,977 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pass Key Editor</title>
+<style>
+  :root {
+    --bg: #f5f5f7; --card: #ffffff; --text: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7;
+    --accent: #0a84ff; --accent-text: #ffffff; --danger: #d70015; --ok: #1f9d48; --input: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000; --card: #1c1c1e; --text: #f5f5f7; --muted: #8e8e93; --line: #38383a;
+      --accent: #0a84ff; --accent-text: #ffffff; --danger: #ff453a; --ok: #30d158; --input: #2c2c2e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 26px; margin: 0; }
+  h2 { font-size: 17px; margin: 0 0 12px; }
+  .top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  .top .spacer { flex: 1; }
+  .status { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
+  .dot.on { background: var(--ok); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin-bottom: 18px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--input); color: var(--text);
+           border-radius: 9px; padding: 7px 14px; cursor: pointer; white-space: nowrap; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button.danger { color: var(--danger); }
+  button.icon { padding: 7px 10px; }
+  input[type=text], input[type=password], input[type=search], input[type=number] {
+    font: inherit; width: 100%; padding: 7px 10px; border: 1px solid var(--line); border-radius: 9px;
+    background: var(--input); color: var(--text); min-width: 0; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+  input.bad { outline: 2px solid var(--danger); outline-offset: -1px; }
+  select { font: inherit; padding: 7px 8px; border: 1px solid var(--line); border-radius: 9px;
+           background: var(--input); color: var(--text); max-width: 100%; }
+  label.check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); white-space: nowrap; }
+  .grid { display: grid; grid-template-columns: 1.1fr 1.1fr 1.4fr; gap: 10px; }
+  .field > span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
+  .passrow { display: flex; gap: 6px; }
+  .passrow input { flex: 1; min-width: 110px; }
+  .row-actions { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+  .row-actions .spacer { flex: 1; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-weight: 600; font-size: 12px; color: var(--muted); text-transform: uppercase;
+       letter-spacing: .04em; padding: 0 6px 8px; }
+  td { padding: 6px; border-top: 1px solid var(--line); vertical-align: middle; }
+  td.flags { white-space: nowrap; }
+  td.flags label { margin-right: 10px; }
+  td.act { white-space: nowrap; text-align: right; }
+  tr.dirty td { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  .muted { color: var(--muted); }
+  .note { color: var(--muted); font-size: 13px; }
+  .warn { background: color-mix(in srgb, var(--danger) 12%, var(--card)); border-color: var(--danger); }
+  #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--text); color: var(--bg);
+           padding: 10px 18px; border-radius: 22px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 90vw; }
+  #toast.show { opacity: 1; }
+  #toast.err { background: var(--danger); color: #fff; }
+  .hidden { display: none !important; }
+  .stats { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .stat { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; min-width: 120px; }
+  .stat b { display: block; font-size: 18px; }
+  .stat span { font-size: 12px; color: var(--muted); }
+  .stat.bad b { color: var(--danger); }
+  td .site { font-weight: 600; }
+  td .sub { font-size: 13px; color: var(--muted); }
+  td.num { white-space: nowrap; }
+  .empty { text-align: center; padding: 28px 0; color: var(--muted); }
+  @media (max-width: 720px) {
+    .grid { grid-template-columns: 1fr; }
+    table, thead, tbody, tr, td { display: block; }
+    thead { display: none; }
+    tr { border-top: 1px solid var(--line); padding: 10px 0; }
+    td { border: 0; padding: 4px 0; }
+    td.act { text-align: left; }
+    td.num { white-space: normal; }
+    td[data-label]::before { content: attr(data-label) ": "; color: var(--muted); }
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="top">
+    <h1>Pass Key</h1>
+    <span class="status"><span class="dot" id="dot"></span><span id="statusText">Не подключено</span></span>
+    <span class="spacer"></span>
+    <button class="primary" id="connectBtn">Подключить плату</button>
+    <button id="disconnectBtn" class="hidden">Отключить</button>
+  </div>
+
+  <div class="card warn hidden" id="unsupported">
+    Этот браузер не поддерживает Web Serial. Откройте страницу в <b>Chrome</b>, <b>Edge</b>, Opera или Яндекс Браузере
+    на компьютере. Safari и Firefox не подойдут.
+  </div>
+
+  <div id="app" class="hidden">
+    <div class="card warn hidden" id="lockedBanner">
+      <b>Плата заблокирована.</b> Введите PIN на экране платы. Страница подождёт
+      и сама покажет записи.
+    </div>
+    <div id="editor">
+    <div class="card">
+      <h2>Новая запись</h2>
+      <div class="grid">
+        <label class="field"><span>Название</span><input type="text" id="newName" maxlength="31" placeholder="GitHub"></label>
+        <label class="field"><span>Логин</span><input type="text" id="newLogin" maxlength="62" placeholder="user@mail.com" autocomplete="off"></label>
+        <label class="field"><span>Пароль</span>
+          <div class="passrow">
+            <input type="password" id="newPass" maxlength="63" autocomplete="new-password">
+            <button class="icon" id="newShow" title="Показать">👁</button>
+            <button class="icon" id="newGen" title="Сгенерировать">🎲</button>
+          </div>
+        </label>
+      </div>
+      <div class="row-actions">
+        <label class="check"><input type="checkbox" id="newLoginTab"> Сначала логин + Tab</label>
+        <label class="check"><input type="checkbox" id="newEnter"> Enter в конце</label>
+        <span class="spacer"></span>
+        <label class="check">Длина <input type="number" id="genLen" min="8" max="63" value="20" style="width:70px"></label>
+        <label class="check"><input type="checkbox" id="genSym" checked> символы</label>
+        <button class="primary" id="addBtn">Добавить</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="top" style="margin-bottom:12px">
+        <h2 style="margin:0">Записи <span class="muted" id="count"></span></h2>
+        <span class="spacer"></span>
+        <input type="search" id="search" placeholder="Поиск" style="max-width:220px">
+      </div>
+      <table>
+        <thead><tr><th style="width:20%">Название</th><th style="width:22%">Логин</th><th style="width:24%">Новый пароль</th><th>Ввод</th><th></th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="empty hidden" id="empty">Пока пусто. Добавьте запись выше или импортируйте CSV.</div>
+      <p class="note">Плата никогда не отдаёт пароли обратно на компьютер, поэтому здесь их не видно.
+        Поле «Новый пароль» оставьте пустым, чтобы сохранить старый.</p>
+    </div>
+
+    <div class="card">
+      <h2>Импорт из CSV</h2>
+      <p class="note" style="margin-top:0">Подходит экспорт паролей из Chrome, Edge, Firefox, Safari, Bitwarden, 1Password:
+        нужны колонки с названием или адресом сайта, логином и паролем. Записи, которые уже есть (то же название и логин),
+        пропускаются.</p>
+      <div class="row-actions">
+        <input type="file" id="csvFile" accept=".csv,text/csv">
+        <label class="check"><input type="checkbox" id="impLoginTab"> Сначала логин + Tab</label>
+        <label class="check"><input type="checkbox" id="impEnter"> Enter в конце</label>
+        <span class="spacer"></span>
+        <button id="importBtn" disabled>Импортировать</button>
+      </div>
+      <p class="note" id="importInfo"></p>
+    </div>
+
+    <div class="card">
+      <h2>Резервная копия</h2>
+      <p class="note" style="margin-top:0">Файл копии зашифрован <b>кодом восстановления</b> из 24 цифр. Код хранится только
+        на плате: <b>Settings → Backup code</b>. Запишите его на бумаге и храните отдельно от платы. Без кода файл
+        бесполезен, а код никогда не передаётся на компьютер.</p>
+      <div class="row-actions">
+        <button class="primary" id="backupBtn">Скачать копию</button>
+      </div>
+      <div class="row-actions">
+        <input type="file" id="restoreFile" accept=".pkb">
+        <label class="check"><input type="checkbox" id="restoreReplace"> Заменить текущий список</label>
+        <span class="spacer"></span>
+        <button id="restoreBtn" disabled>Восстановить</button>
+      </div>
+      <p class="note" id="restoreInfo">При восстановлении код вводится на экране платы. Без галочки записи из копии
+        добавляются к текущим, совпадающие (то же название и логин) пропускаются.</p>
+    </div>
+
+    </div>
+    <div class="card hidden" id="keysCard">
+      <h2>Панель горячих клавиш</h2>
+      <p class="note" style="margin-top:0">Четыре большие плитки режима <b>Hotkeys</b> на плате (2 × 2). Каждая нажимает
+        сочетание клавиш или медиаклавишу. Порядок: первая — слева вверху, вторая — справа вверху, третья и
+        четвёртая — внизу. Панель не секретна, её можно менять
+        и на заблокированной плате.</p>
+      <table>
+        <thead><tr><th style="width:28%">Название</th><th style="width:26%">Клавиша</th><th>Вместе с</th><th></th></tr></thead>
+        <tbody id="keyRows"></tbody>
+      </table>
+      <div class="row-actions">
+        <button id="keyAdd">Добавить плитку</button>
+        <select id="keyPreset" class="select">
+          <option value="mac">Набор для Mac</option>
+          <option value="win">Набор для Windows</option>
+        </select>
+        <button id="keyPresetBtn">Подставить набор</button>
+        <span class="spacer"></span>
+        <button class="primary" id="keySave" disabled>Сохранить на плату</button>
+      </div>
+    </div>
+    <div class="card hidden" id="fidoCard">
+      <h2>Аппаратный ключ (FIDO2 / passkeys)</h2>
+      <div class="stats">
+        <div class="stat" id="fidoPinStat"><b id="fidoPin">—</b><span>PIN ключа</span></div>
+        <div class="stat"><b id="fidoCount">—</b><span>passkeys на ключе</span></div>
+        <div class="stat"><b id="fidoClock">—</b><span>часы платы</span></div>
+      </div>
+      <div class="row-actions" style="margin-top:0" id="fidoUnlockRow">
+        <label class="field" style="flex:1;min-width:200px"><span>PIN ключа FIDO</span>
+          <input type="password" id="fidoPinInput" class="any" maxlength="63" autocomplete="off" placeholder="тот, что задавали в браузере"></label>
+        <button class="primary" id="fidoShowBtn" style="align-self:flex-end">Показать passkeys</button>
+      </div>
+      <p class="note" id="fidoNote">Список хранится на ключе в зашифрованном виде, поэтому нужен PIN. Каждая неверная
+        попытка расходует одну из 8, как в браузере.</p>
+      <div id="fidoListBox" class="hidden">
+        <table>
+          <thead><tr><th>Сайт и пользователь</th><th>Создан</th><th>Последний вход</th><th>Входов</th><th></th></tr></thead>
+          <tbody id="fidoRows"></tbody>
+        </table>
+        <div class="empty hidden" id="fidoEmpty">На ключе нет passkeys.</div>
+        <div class="row-actions">
+          <span class="note">Даты известны, только если плата знала время: страница сообщает его при подключении.
+            Входы после включения платы получают дату, когда страница откроется, если плату не выключали.
+            Удалённый здесь passkey останется в настройках сайта: уберите его и там.</span>
+          <span class="spacer"></span>
+          <button id="fidoRefreshBtn">Обновить</button>
+          <button id="fidoForgetBtn">Скрыть</button>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Опасная зона</h2>
+      <div class="row-actions" style="margin-top:0">
+        <span class="note">Удалить все записи и снять защиту. Работает и на заблокированной плате,
+          если забыт PIN. Отменить нельзя.</span>
+        <span class="spacer"></span>
+        <button class="danger" id="wipeBtn">Стереть всё</button>
+      </div>
+    </div>
+  </div>
+
+  <p class="note">Плата набирает текст как клавиатура с раскладкой US. Поддерживаются только латиница, цифры и
+    символы ASCII. Перед вводом переключите компьютер на английскую раскладку.</p>
+</main>
+<div id="toast"></div>
+
+<script>
+'use strict';
+
+// The PID changes whenever the board's USB interfaces do; keep every firmware with the editor port here.
+const VID = 0xCAFE, PIDS = [0x4A21, 0x4A22, 0x4A23];
+const LIMITS = { name: 31, login: 62, pass: 63 };
+const FLAG_ENTER = 1, FLAG_LOGIN = 2;
+
+const $ = id => document.getElementById(id);
+let entries = [];        // {index, name, login, flags, passLen}
+let maxEntries = 96;
+
+// ---------------------------------------------------------------- serial
+
+const dev = {
+  port: null, writer: null, reader: null,
+  buf: '', lines: [], waiter: null, chain: Promise.resolve(),
+
+  async open(port) {
+    await port.open({ baudRate: 115200 });
+    try { await port.setSignals({ dataTerminalReady: true }); } catch (e) { /* not all platforms */ }
+    this.port = port;
+    this.writer = port.writable.getWriter();
+    this.readLoop();
+  },
+
+  async readLoop() {
+    const decoder = new TextDecoder();
+    try {
+      this.reader = this.port.readable.getReader();
+      for (;;) {
+        const { value, done } = await this.reader.read();
+        if (done) break;
+        this.buf += decoder.decode(value, { stream: true });
+        let i;
+        while ((i = this.buf.indexOf('\n')) >= 0) {
+          this.lines.push(this.buf.slice(0, i).replace(/\r$/, ''));
+          this.buf = this.buf.slice(i + 1);
+        }
+        if (this.waiter && this.lines.length) this.waiter();
+      }
+    } catch (e) { /* port went away */ }
+    finally { if (this.port) onDisconnected(); }
+  },
+
+  nextLine(timeoutMs) {
+    if (this.lines.length) return Promise.resolve(this.lines.shift());
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => { this.waiter = null; reject(new Error('плата не отвечает')); }, timeoutMs);
+      this.waiter = () => { clearTimeout(t); this.waiter = null; resolve(this.lines.shift()); };
+    });
+  },
+
+  // Sends one request and collects lines up to the final OK/ERR. Requests run one at a time.
+  cmd(fields, timeoutMs = 8000) {
+    const run = async () => {
+      if (!this.writer) throw new Error('плата не подключена');
+      this.lines = [];
+      await this.writer.write(new TextEncoder().encode(fields.join('\t') + '\n'));
+      const data = [];
+      for (;;) {
+        const line = await this.nextLine(timeoutMs);
+        if (line.startsWith('OK')) return { data, reply: line.slice(2).trim() };
+        if (line.startsWith('ERR')) throw new Error(line.slice(3).trim());
+        data.push(line);
+      }
+    };
+    const p = this.chain.then(run, run);
+    this.chain = p.catch(() => {});
+    return p;
+  },
+
+  async close() {
+    const port = this.port;
+    this.port = null;
+    try { await this.reader?.cancel(); } catch (e) {}
+    try { this.reader?.releaseLock(); } catch (e) {}
+    try { this.writer?.releaseLock(); } catch (e) {}
+    try { await port?.close(); } catch (e) {}
+    this.writer = this.reader = null;
+  },
+};
+
+async function connect(port) {
+  try {
+    await dev.open(port);
+    setConnected(true);
+    await refresh();
+    await loadKeys();
+    await loadFido();
+  } catch (e) {
+    toast('Не удалось подключиться: ' + e.message, true);
+    await dev.close();
+    setConnected(false);
+  }
+}
+
+function onDisconnected() {
+  fidoForget();
+  dev.close();
+  setConnected(false);
+  toast('Плата отключена', true);
+}
+
+const MODE_NAMES = { none: 'без защиты', pin: 'защита PIN' };
+let lockPoll = null;
+
+// HELLO -> {locked, mode}. Older firmware answers without the last two fields.
+async function hello(timeoutMs = 3000) {
+  const parts = (await dev.cmd(['HELLO'], timeoutMs)).reply.split(' ');
+  if (parts[0] !== 'PassKey') throw new Error('это не Pass Key');
+  maxEntries = parseInt(parts[2], 10) || maxEntries;
+  const info = { locked: parts[3] === 'locked', mode: parts[4] || 'none' };
+  $('statusText').textContent = 'Подключено · ' + (MODE_NAMES[info.mode] || info.mode);
+  return info;
+}
+
+// While locked, keep asking the board until it's unlocked on screen.
+function setLocked(locked) {
+  $('lockedBanner').classList.toggle('hidden', !locked);
+  $('editor').classList.toggle('hidden', locked);
+  clearInterval(lockPoll);
+  lockPoll = null;
+  if (!locked) return;
+  lockPoll = setInterval(async () => {
+    try {
+      const info = await hello(2000);
+      if (!info.locked) { setLocked(false); await refresh(); }
+    } catch (e) { /* board busy or gone; the disconnect handler deals with the latter */ }
+  }, 1500);
+}
+
+function setConnected(on) {
+  $('dot').classList.toggle('on', on);
+  $('statusText').textContent = on ? 'Подключено' : 'Не подключено';
+  $('connectBtn').classList.toggle('hidden', on);
+  $('disconnectBtn').classList.toggle('hidden', !on);
+  $('app').classList.toggle('hidden', !on);
+  if (!on) setLocked(false);
+}
+
+// ---------------------------------------------------------------- data
+
+function check(value, max, what) {
+  if (value.length > max) return `${what}: не длиннее ${max} символов`;
+  if (!/^[\x20-\x7E]*$/.test(value)) return `${what}: только латиница, цифры и символы ASCII`;
+  return null;
+}
+
+async function refresh() {
+  if ((await hello()).locked) return setLocked(true);
+  const r = await dev.cmd(['LIST']);
+  entries = r.data.filter(l => l.startsWith('E\t')).map(l => {
+    const f = l.split('\t');
+    return { index: +f[1], name: f[2], login: f[3], flags: +f[4], passLen: +f[5] };
+  });
+  render();
+}
+
+function render() {
+  const q = $('search').value.trim().toLowerCase();
+  const tbody = $('rows');
+  tbody.textContent = '';
+  const shown = entries.filter(e => !q || e.name.toLowerCase().includes(q) || e.login.toLowerCase().includes(q));
+  for (const e of shown) tbody.appendChild(renderRow(e));
+  $('count').textContent = `${entries.length} из ${maxEntries}`;
+  $('empty').classList.toggle('hidden', entries.length > 0);
+}
+
+function el(tag, props = {}, children = []) {
+  const n = document.createElement(tag);
+  const { dataset, ...rest } = props;
+  Object.assign(n, rest);
+  if (dataset) Object.assign(n.dataset, dataset);
+  for (const c of children) n.append(c);
+  return n;
+}
+
+function renderRow(e) {
+  const tr = el('tr');
+  const name = el('input', { type: 'text', value: e.name, maxLength: LIMITS.name });
+  const login = el('input', { type: 'text', value: e.login, maxLength: LIMITS.login, autocomplete: 'off' });
+  const pass = el('input', { type: 'password', maxLength: LIMITS.pass, autocomplete: 'new-password',
+                             placeholder: e.passLen ? `не меняется (${e.passLen} симв.)` : 'нет пароля' });
+  const gen = el('button', { className: 'icon', title: 'Сгенерировать', textContent: '🎲' });
+  const loginTab = el('input', { type: 'checkbox', checked: !!(e.flags & FLAG_LOGIN) });
+  const enter = el('input', { type: 'checkbox', checked: !!(e.flags & FLAG_ENTER) });
+  const save = el('button', { className: 'primary', textContent: 'Сохранить', disabled: true });
+  const del = el('button', { className: 'danger', textContent: 'Удалить' });
+
+  const markDirty = () => { tr.classList.add('dirty'); save.disabled = false; };
+  for (const i of [name, login, pass, loginTab, enter]) i.addEventListener('input', markDirty);
+  gen.onclick = () => { pass.value = generate(); pass.type = 'text'; markDirty(); };
+
+  save.onclick = () => busy(save, async () => {
+    const err = check(name.value, LIMITS.name, 'Название') || (name.value.trim() ? null : 'Название пустое') ||
+                check(login.value, LIMITS.login, 'Логин') || check(pass.value, LIMITS.pass, 'Пароль');
+    if (err) return toast(err, true);
+    const flags = (loginTab.checked ? FLAG_LOGIN : 0) | (enter.checked ? FLAG_ENTER : 0);
+    const fields = ['SET', e.index, name.value.trim(), login.value, flags];
+    if (pass.value) fields.push(pass.value);
+    await dev.cmd(fields);
+    toast('Сохранено');
+    await refresh();
+  });
+  del.onclick = () => busy(del, async () => {
+    if (!confirm(`Удалить «${e.name}»?`)) return;
+    await dev.cmd(['DEL', e.index]);
+    toast('Удалено');
+    await refresh();
+  });
+
+  tr.append(
+    el('td', {}, [name]),
+    el('td', {}, [login]),
+    el('td', {}, [el('div', { className: 'passrow' }, [pass, gen])]),
+    el('td', { className: 'flags' }, [
+      el('label', { className: 'check', title: 'Сначала набрать логин и Tab' }, [loginTab, 'логин+Tab']),
+      el('label', { className: 'check', title: 'Нажать Enter в конце' }, [enter, 'Enter']),
+    ]),
+    el('td', { className: 'act' }, [save, ' ', del]),
+  );
+  return tr;
+}
+
+function generate() {
+  const len = Math.min(LIMITS.pass, Math.max(8, parseInt($('genLen').value, 10) || 20));
+  const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  const set = letters + ($('genSym').checked ? '!@#$%^&*-_=+?.' : '');
+  // Rejection sampling: every character equally likely.
+  const out = [];
+  const buf = new Uint8Array(1);
+  while (out.length < len) {
+    crypto.getRandomValues(buf);
+    if (buf[0] < 256 - (256 % set.length)) out.push(set[buf[0] % set.length]);
+  }
+  return out.join('');
+}
+
+async function busy(button, fn) {
+  button.disabled = true;
+  try { await fn(); }
+  catch (e) {
+    if (e.message === 'locked') { setLocked(true); toast('Плата заблокирована: разблокируйте её на экране', true); }
+    else toast('Ошибка: ' + e.message, true);
+  }
+  finally { button.disabled = false; }
+}
+
+let toastTimer;
+function toast(msg, isErr = false) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.toggle('err', isErr);
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), isErr ? 4000 : 2000);
+}
+
+// ---------------------------------------------------------------- CSV import
+
+function parseCSV(text) {
+  const rows = [];
+  let row = [], field = '', quoted = false;
+  text = text.replace(/^\uFEFF/, '');
+  const firstLine = text.split('\n', 1)[0];
+  const delim = !firstLine.includes(',') && firstLine.includes(';') ? ';' : ',';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"' && text[i + 1] === '"') { field += '"'; i++; }
+      else if (ch === '"') quoted = false;
+      else field += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === delim) { row.push(field); field = ''; }
+    else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); rows.push(row); row = []; field = '';
+    } else field += ch;
+  }
+  if (field || row.length) { row.push(field); rows.push(row); }
+  return rows.filter(r => r.some(c => c.trim()));
+}
+
+function pickColumn(header, names) {
+  for (const n of names) {
+    const i = header.indexOf(n);
+    if (i >= 0) return i;
+  }
+  return -1;
+}
+
+function hostOf(url) {
+  try { return new URL(url.includes('://') ? url : 'https://' + url).hostname.replace(/^www\./, ''); }
+  catch (e) { return ''; }
+}
+
+let importRows = [];
+
+$('csvFile').onchange = async () => {
+  importRows = [];
+  $('importBtn').disabled = true;
+  const file = $('csvFile').files[0];
+  if (!file) return;
+  const rows = parseCSV(await file.text());
+  if (rows.length < 2) { $('importInfo').textContent = 'В файле нет записей.'; return; }
+  const header = rows[0].map(h => h.trim().toLowerCase());
+  const cName = pickColumn(header, ['name', 'title', 'название']);
+  const cUrl = pickColumn(header, ['url', 'login_uri', 'website', 'web site', 'адрес']);
+  const cLogin = pickColumn(header, ['username', 'login_username', 'login', 'user', 'email', 'логин']);
+  const cPass = pickColumn(header, ['password', 'login_password', 'пароль']);
+  if (cPass < 0 || (cName < 0 && cUrl < 0)) {
+    $('importInfo').textContent = 'Не нашёл колонки с паролем и названием/адресом. Заголовок: ' + rows[0].join(', ');
+    return;
+  }
+  const skipped = [];
+  for (const r of rows.slice(1)) {
+    let name = (cName >= 0 ? r[cName] || '' : '').trim();
+    if (!name || check(name, 1e9, '')) name = cUrl >= 0 ? hostOf(r[cUrl] || '') : '';
+    name = name.slice(0, LIMITS.name);
+    const login = cLogin >= 0 ? (r[cLogin] || '').trim() : '';
+    const pass = r[cPass] || '';
+    const label = name || login || '(без названия)';
+    if (!name) { skipped.push(`${label}: нет названия`); continue; }
+    const err = check(login, LIMITS.login, 'логин') || check(pass, LIMITS.pass, 'пароль');
+    if (err) { skipped.push(`${label}: ${err}`); continue; }
+    importRows.push({ name, login, pass });
+  }
+  let info = `Готово к импорту: ${importRows.length}.`;
+  if (skipped.length) info += ` Пропущено ${skipped.length}: ` + skipped.slice(0, 5).join('; ') + (skipped.length > 5 ? '…' : '');
+  $('importInfo').textContent = info;
+  $('importBtn').disabled = importRows.length === 0;
+};
+
+$('importBtn').onclick = () => busy($('importBtn'), async () => {
+  const flags = ($('impLoginTab').checked ? FLAG_LOGIN : 0) | ($('impEnter').checked ? FLAG_ENTER : 0);
+  const have = new Set(entries.map(e => e.name.toLowerCase() + '\t' + e.login.toLowerCase()));
+  let added = 0, dup = 0;
+  for (const r of importRows) {
+    const key = r.name.toLowerCase() + '\t' + r.login.toLowerCase();
+    if (have.has(key)) { dup++; continue; }
+    if (entries.length + added >= maxEntries) { toast(`Память платы заполнена (${maxEntries} записей)`, true); break; }
+    await dev.cmd(['ADD', r.name, r.login, flags, r.pass]);
+    have.add(key);
+    added++;
+    $('importInfo').textContent = `Импортировано ${added} из ${importRows.length}…`;
+  }
+  importRows = [];
+  $('csvFile').value = '';
+  $('importInfo').textContent = `Импортировано: ${added}` + (dup ? `, уже были: ${dup}` : '') + '.';
+  await refresh();
+  toast('Импорт завершён. Удалите CSV-файл: в нём пароли открытым текстом.');
+});
+
+// ---------------------------------------------------------------- wiring
+
+$('newShow').onclick = () => { const p = $('newPass'); p.type = p.type === 'password' ? 'text' : 'password'; };
+$('newGen').onclick = () => { $('newPass').value = generate(); $('newPass').type = 'text'; };
+$('search').oninput = render;
+
+$('addBtn').onclick = () => busy($('addBtn'), async () => {
+  const name = $('newName').value.trim(), login = $('newLogin').value, pass = $('newPass').value;
+  const err = (name ? null : 'Введите название') || check(name, LIMITS.name, 'Название') ||
+              check(login, LIMITS.login, 'Логин') || check(pass, LIMITS.pass, 'Пароль');
+  if (err) return toast(err, true);
+  if (entries.length >= maxEntries) return toast(`Память платы заполнена (${maxEntries} записей)`, true);
+  const flags = ($('newLoginTab').checked ? FLAG_LOGIN : 0) | ($('newEnter').checked ? FLAG_ENTER : 0);
+  await dev.cmd(['ADD', name, login, flags, pass]);
+  for (const id of ['newName', 'newLogin', 'newPass']) $(id).value = '';
+  $('newPass').type = 'password';
+  toast('Добавлено');
+  await refresh();
+});
+
+// ---------------------------------------------------------------- hotkeys
+
+const MOD_CTRL = 1, MOD_SHIFT = 2, MOD_ALT = 4, MOD_GUI = 8;
+const HOTKEYS_MAX = 4;   // one screen on the board, 2 x 2
+
+// HID keyboard usages (type 0) and consumer usages (type 1) offered in the key menu.
+const KEY_OPTIONS = (() => {
+  const k = [];
+  for (let i = 0; i < 26; i++) k.push([4 + i, String.fromCharCode(65 + i)]);
+  for (let i = 1; i <= 9; i++) k.push([0x1D + i, String(i)]);
+  k.push([0x27, '0']);
+  for (let i = 1; i <= 12; i++) k.push([0x39 + i, 'F' + i]);
+  for (let i = 13; i <= 19; i++) k.push([0x68 + i - 13, 'F' + i]);
+  k.push([0x2C, 'Пробел'], [0x28, 'Enter'], [0x29, 'Esc'], [0x2B, 'Tab'], [0x2A, 'Backspace'], [0x4C, 'Delete'],
+         [0x52, '↑'], [0x51, '↓'], [0x50, '←'], [0x4F, '→'], [0x4A, 'Home'], [0x4D, 'End'], [0x4B, 'PgUp'], [0x4E, 'PgDn'],
+         [0x2D, '-'], [0x2E, '='], [0x2F, '['], [0x30, ']'], [0x31, '\\'], [0x33, ';'], [0x34, "'"], [0x35, '`'],
+         [0x36, ','], [0x37, '.'], [0x38, '/']);
+  return k;
+})();
+const MEDIA_OPTIONS = [[0xCD, 'Пауза / воспроизведение'], [0xB5, 'Следующий трек'], [0xB6, 'Предыдущий трек'],
+                       [0xE2, 'Выключить звук'], [0xE9, 'Громче'], [0xEA, 'Тише'], [0x6F, 'Ярче экран'], [0x70, 'Темнее экран']];
+
+const KEY_PRESETS = {
+  mac: [
+    { label: 'Lock screen', type: 0, mods: MOD_CTRL | MOD_GUI, code: 0x14 },
+    { label: 'Screenshot', type: 0, mods: MOD_GUI | MOD_SHIFT, code: 0x21 },
+    { label: 'Mute Zoom', type: 0, mods: MOD_GUI | MOD_SHIFT, code: 0x04 },
+    { label: 'Play / Pause', type: 1, mods: 0, code: 0xCD },
+  ],
+  win: [
+    { label: 'Lock screen', type: 0, mods: MOD_GUI, code: 0x0F },                 // Win+L
+    { label: 'Screenshot', type: 0, mods: MOD_GUI | MOD_SHIFT, code: 0x16 },      // Win+Shift+S
+    { label: 'Mute Teams', type: 0, mods: MOD_CTRL | MOD_SHIFT, code: 0x10 },     // Ctrl+Shift+M
+    { label: 'Play / Pause', type: 1, mods: 0, code: 0xCD },
+  ],
+};
+
+let hotkeys = [];
+let keysChanged = false;   // edits not yet on the board
+
+function keysDirty(dirty = true) { keysChanged = dirty; $('keySave').disabled = !dirty; }
+
+async function loadKeys() {
+  try {
+    const r = await dev.cmd(['KEYS']);
+    hotkeys = r.data.filter(l => l.startsWith('K\t')).map(l => {
+      const f = l.split('\t');
+      return { label: f[1], type: +f[2], mods: +f[3], code: +f[4] };
+    });
+    $('keysCard').classList.remove('hidden');
+    renderKeys();
+    keysDirty(false);
+  } catch (e) {
+    $('keysCard').classList.add('hidden');   // older firmware without a panel
+  }
+}
+
+function keySelect(k) {
+  const sel = el('select');
+  const group = (title, items, type) => {
+    const g = el('optgroup', { label: title });
+    for (const [code, name] of items) g.append(el('option', { value: `${type}:${code}`, textContent: name }));
+    sel.append(g);
+  };
+  group('Клавиши', KEY_OPTIONS, 0);
+  group('Медиа', MEDIA_OPTIONS, 1);
+  sel.value = `${k.type}:${k.code}`;
+  if (sel.value !== `${k.type}:${k.code}`) {   // a code the menu doesn't list: keep it
+    sel.append(el('option', { value: `${k.type}:${k.code}`, textContent: `код 0x${k.code.toString(16)}` }));
+    sel.value = `${k.type}:${k.code}`;
+  }
+  return sel;
+}
+
+function renderKeys() {
+  const tbody = $('keyRows');
+  tbody.textContent = '';
+  hotkeys.forEach((k, i) => {
+    const label = el('input', { type: 'text', value: k.label, maxLength: 19 });
+    label.oninput = () => { k.label = label.value; keysDirty(); };
+    const sel = keySelect(k);
+    const mods = [[MOD_CTRL, '⌃ Ctrl'], [MOD_ALT, '⌥ Opt/Alt'], [MOD_SHIFT, '⇧ Shift'], [MOD_GUI, '⌘ Cmd/Win']].map(([bit, name]) => {
+      const box = el('input', { type: 'checkbox', checked: !!(k.mods & bit), disabled: k.type === 1 });
+      box.onchange = () => { k.mods = box.checked ? k.mods | bit : k.mods & ~bit; keysDirty(); };
+      return el('label', { className: 'check' }, [box, name]);
+    });
+    sel.onchange = () => {
+      const [type, code] = sel.value.split(':').map(Number);
+      k.type = type; k.code = code;
+      if (type === 1) k.mods = 0;
+      renderKeys(); keysDirty();
+    };
+    const move = (d) => { const j = i + d; [hotkeys[i], hotkeys[j]] = [hotkeys[j], hotkeys[i]]; renderKeys(); keysDirty(); };
+    const up = el('button', { className: 'icon', textContent: '↑', title: 'Выше', disabled: i === 0, onclick: () => move(-1) });
+    const down = el('button', { className: 'icon', textContent: '↓', title: 'Ниже', disabled: i === hotkeys.length - 1, onclick: () => move(1) });
+    const del = el('button', { className: 'icon danger', textContent: '✕', title: 'Удалить',
+                               onclick: () => { hotkeys.splice(i, 1); renderKeys(); keysDirty(); } });
+    tbody.append(el('tr', {}, [
+      el('td', {}, [label]), el('td', {}, [sel]),
+      el('td', { className: 'flags' }, mods),
+      el('td', { className: 'act' }, [up, ' ', down, ' ', del]),
+    ]));
+  });
+  $('keyAdd').disabled = hotkeys.length >= HOTKEYS_MAX;
+}
+
+$('keyAdd').onclick = () => {
+  hotkeys.push({ label: 'New key', type: 0, mods: MOD_GUI, code: 0x04 });
+  renderKeys(); keysDirty();
+};
+
+$('keyPresetBtn').onclick = () => {
+  if (hotkeys.length && !confirm('Заменить плитки выбранным набором? Сохраните, чтобы отправить на плату.')) return;
+  hotkeys = KEY_PRESETS[$('keyPreset').value].map(k => ({ ...k }));
+  renderKeys(); keysDirty();
+};
+
+$('keySave').onclick = () => busy($('keySave'), async () => {
+  for (const k of hotkeys) {
+    const err = (k.label.trim() ? null : 'У плитки нет названия') || check(k.label, 19, 'Название плитки');
+    if (err) return toast(err, true);
+  }
+  await dev.cmd(['KEYS_BEGIN', hotkeys.length]);
+  for (const k of hotkeys) await dev.cmd(['KEY', k.label.trim(), k.type, k.mods, k.code]);
+  await dev.cmd(['KEYS_END']);
+  toast('Панель сохранена');
+  await loadKeys();
+}).then(() => keysDirty(keysChanged));   // busy() re-enables the button; keep it off when saved
+
+// ---------------------------------------------------------------- backup
+
+const BACKUP_CHUNK = 96;   // bytes per R line, as the board sends them
+
+function toBase64(bytes) {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+$('backupBtn').onclick = () => busy($('backupBtn'), async () => {
+  const r = await dev.cmd(['BACKUP'], 20000);
+  const bin = r.data.filter(l => l.startsWith('B\t')).map(l => atob(l.slice(2))).join('');
+  if (bin.length !== parseInt(r.reply, 10)) throw new Error('копия пришла не полностью');
+  const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+  const a = el('a', {
+    href: URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' })),
+    download: `passkey-backup-${new Date().toISOString().slice(0, 10)}.pkb`,
+  });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  toast(`Копия сохранена, записей: ${entries.length}`);
+});
+
+$('restoreFile').onchange = () => { $('restoreBtn').disabled = !$('restoreFile').files[0]; };
+
+$('restoreBtn').onclick = () => busy($('restoreBtn'), async () => {
+  const bytes = new Uint8Array(await $('restoreFile').files[0].arrayBuffer());
+  if (bytes.length < 72 || String.fromCharCode(...bytes.slice(0, 4)) !== 'PKB1')
+    return toast('Это не файл копии Pass Key', true);
+  const replace = $('restoreReplace').checked;
+  if (replace && !confirm('Заменить все записи на плате записями из копии?')) return;
+
+  await dev.cmd(['RESTORE', bytes.length]);
+  for (let i = 0; i < bytes.length; i += BACKUP_CHUNK) {
+    await dev.cmd(['R', toBase64(bytes.slice(i, i + BACKUP_CHUNK))]);
+    $('restoreInfo').textContent = `Передача: ${Math.min(100, Math.round((i + BACKUP_CHUNK) * 100 / bytes.length))}%`;
+  }
+  const end = await dev.cmd(['RESTORE_END', replace ? 'replace' : 'merge']);
+  $('restoreInfo').textContent = `Записей в копии: ${end.reply}. Введите код восстановления на экране платы…`;
+  toast('Введите код восстановления на экране платы');
+
+  // The code is typed on the board; wait for it (up to 10 minutes).
+  for (let t = 0; t < 600; t++) {
+    await new Promise(r => setTimeout(r, 1000));
+    const st = (await dev.cmd(['RESTORE_STATUS'])).reply.split(' ');
+    if (st[0] === 'waiting') continue;
+    if (st[0] === 'done') {
+      $('restoreInfo').textContent = `Восстановлено: ${st[1]}, пропущено: ${st[2]}.`;
+      toast('Копия восстановлена');
+      $('restoreFile').value = '';
+      $('restoreBtn').disabled = true;
+      return refresh();
+    }
+    $('restoreInfo').textContent = st[0] === 'cancelled' ? 'Восстановление отменено на плате.' : 'Не удалось восстановить копию.';
+    return;
+  }
+  $('restoreInfo').textContent = 'Код так и не ввели. Можно попробовать снова.';
+});
+
+$('wipeBtn').onclick = () => busy($('wipeBtn'), async () => {
+  if (!confirm('Стереть ВСЕ пароли с платы? Это нельзя отменить.')) return;
+  await dev.cmd(['WIPE'], 15000);
+  toast('Всё стёрто');
+  await refresh();
+});
+
+// Live validation: red outline on fields the board can't store.
+document.addEventListener('input', ev => {
+  const t = ev.target;
+  if (t.tagName === 'INPUT' && (t.type === 'text' || t.type === 'password') && !t.classList.contains('any'))
+    t.classList.toggle('bad', !/^[\x20-\x7E]*$/.test(t.value));
+});
+
+// ---------------------------------------------------------------- FIDO passkeys
+
+let fidoPin = null;      // kept only while the list is shown, for deleting
+let passkeys = [];       // {slot, id, rp, user, display, created, lastUsed, uses, alg, credProtect}
+
+const PIN_ERRORS = {
+  49: n => `Неверный PIN. Осталось попыток: ${n}`,
+  50: () => 'PIN заблокирован после 8 неверных попыток. Ключ FIDO придётся сбросить в браузере.',
+  52: () => 'Три неверных PIN подряд. Выньте плату из USB и вставьте снова, потом повторите.',
+  53: () => 'PIN ключа ещё не задан: браузер попросит его при первой регистрации passkey.',
+};
+
+// "pin 49 7" from the board -> readable text; anything else unchanged.
+function fidoError(msg) {
+  const m = /^pin (\d+) (\d+)$/.exec(msg);
+  if (m && PIN_ERRORS[m[1]]) return PIN_ERRORS[m[1]](m[2]);
+  if (msg === 'busy') return 'Ключ занят запросом браузера. Повторите через пару секунд.';
+  if (msg === 'no such passkey') return 'Такого passkey уже нет. Обновите список.';
+  return msg;
+}
+
+function hexUtf8(s) {
+  return [...new TextEncoder().encode(s)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function fmtDate(t) {
+  if (!t) return '—';
+  const d = new Date(t * 1000);
+  const days = Math.floor((Date.now() - d) / 86400000);
+  const rel = days <= 0 ? 'сегодня' : days === 1 ? 'вчера' : days < 30 ? `${days} дн. назад` : '';
+  const abs = d.toLocaleString('ru-RU', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  return rel ? `${abs} (${rel})` : abs;
+}
+
+const ALG_NAMES = { '-7': 'ES256', '-8': 'Ed25519', '-35': 'ES384', '-36': 'ES512', '-47': 'ES256K' };
+
+async function loadFido() {
+  let info;
+  try {
+    // The board has no clock; tell it the time so passkey dates can be recorded.
+    await dev.cmd(['TIME', Math.floor(Date.now() / 1000)]);
+    info = (await dev.cmd(['FIDO_INFO'])).reply.split(' ').map(Number);
+  } catch (e) {
+    $('fidoCard').classList.add('hidden');   // firmware without FIDO management
+    return;
+  }
+  const [pinSet, retries, count, max, clock] = info;
+  $('fidoCard').classList.remove('hidden');
+  $('fidoPin').textContent = pinSet ? `задан · попыток ${retries}` : 'не задан';
+  $('fidoPinStat').classList.toggle('bad', pinSet && retries < 8);
+  $('fidoCount').textContent = `${count} из ${max}`;
+  $('fidoClock').textContent = clock ? 'установлены' : 'неизвестно';
+  $('fidoUnlockRow').classList.toggle('hidden', !pinSet || fidoPin !== null);
+  $('fidoNote').classList.toggle('hidden', fidoPin !== null);
+  if (!pinSet) {
+    $('fidoNote').classList.remove('hidden');
+    $('fidoNote').textContent = 'PIN ключа ещё не задан. Браузер попросит его при первой регистрации passkey; ' +
+      'после этого здесь можно будет посмотреть и удалить passkeys.';
+  }
+}
+
+async function listFido(pin) {
+  const r = await dev.cmd(['FIDO_LIST', hexUtf8(pin)], 20000);
+  passkeys = r.data.filter(l => l.startsWith('P\t')).map(l => {
+    const f = l.split('\t');
+    return { slot: +f[1], id: f[2], rp: f[3], user: f[4], display: f[5], created: +f[6], lastUsed: +f[7],
+             uses: +f[8], alg: f[9], credProtect: +f[10] };
+  });
+  passkeys.sort((a, b) => (b.lastUsed || b.created) - (a.lastUsed || a.created) || a.rp.localeCompare(b.rp));
+  fidoPin = pin;
+  renderFido();
+  await loadFido();
+}
+
+function renderFido() {
+  $('fidoListBox').classList.remove('hidden');
+  const tbody = $('fidoRows');
+  tbody.textContent = '';
+  $('fidoEmpty').classList.toggle('hidden', passkeys.length > 0);
+  for (const p of passkeys) {
+    const who = p.display && p.display !== p.user ? `${p.user} · ${p.display}` : (p.user || '(без имени)');
+    const detail = `Алгоритм ${ALG_NAMES[p.alg] || p.alg}, credProtect ${p.credProtect || 1}, слот ${p.slot}, ID ${p.id || '—'}`;
+    const del = el('button', { className: 'danger', textContent: 'Удалить' });
+    del.onclick = () => busy(del, () => deleteFido(p));
+    tbody.append(el('tr', { title: detail }, [
+      el('td', {}, [el('div', { className: 'site', textContent: p.rp }), el('div', { className: 'sub', textContent: who })]),
+      el('td', { className: 'num', textContent: fmtDate(p.created), dataset: { label: 'Создан' } }),
+      el('td', { className: 'num', textContent: fmtDate(p.lastUsed), dataset: { label: 'Последний вход' } }),
+      el('td', { className: 'num', textContent: String(p.uses), dataset: { label: 'Входов' } }),
+      el('td', { className: 'act' }, [del]),
+    ]));
+  }
+}
+
+async function deleteFido(p) {
+  if (!confirm(`Удалить passkey для ${p.rp}${p.user ? ' (' + p.user + ')' : ''}?\n\n` +
+               'Войти на сайт этим ключом больше не получится. Отменить нельзя.')) return;
+  try { await dev.cmd(['FIDO_DEL', hexUtf8(fidoPin), p.slot, p.id], 15000); }
+  catch (e) { throw new Error(fidoError(e.message)); }
+  toast('Passkey удалён');
+  await listFido(fidoPin);
+}
+
+function fidoForget() {
+  fidoPin = null;
+  passkeys = [];
+  $('fidoRows').textContent = '';
+  $('fidoListBox').classList.add('hidden');
+  $('fidoPinInput').value = '';
+}
+
+$('fidoShowBtn').onclick = () => busy($('fidoShowBtn'), async () => {
+  const pin = $('fidoPinInput').value;
+  if (pin.length < 4) throw new Error('PIN ключа — не короче 4 символов');
+  try { await listFido(pin); }
+  catch (e) { await loadFido().catch(() => {}); throw new Error(fidoError(e.message)); }
+  $('fidoPinInput').value = '';
+});
+$('fidoPinInput').addEventListener('keydown', ev => { if (ev.key === 'Enter') $('fidoShowBtn').click(); });
+$('fidoRefreshBtn').onclick = () => busy($('fidoRefreshBtn'), async () => {
+  try { await listFido(fidoPin); } catch (e) { throw new Error(fidoError(e.message)); }
+});
+$('fidoForgetBtn').onclick = async () => { fidoForget(); await loadFido().catch(() => {}); };
+
+if (!('serial' in navigator)) {
+  $('unsupported').classList.remove('hidden');
+  $('connectBtn').disabled = true;
+} else {
+  $('connectBtn').onclick = async () => {
+    let port;
+    try { port = await navigator.serial.requestPort({ filters: PIDS.map(pid => ({ usbVendorId: VID, usbProductId: pid })) }); }
+    catch (e) { return; }   // user closed the picker
+    await connect(port);
+  };
+  $('disconnectBtn').onclick = async () => { fidoForget(); await dev.close(); setConnected(false); };
+
+  // Reconnect on its own to a board that was already allowed once.
+  const autoConnect = async () => {
+    if (dev.port) return;
+    const ports = (await navigator.serial.getPorts()).filter(p => {
+      const i = p.getInfo();
+      return i.usbVendorId === VID && PIDS.includes(i.usbProductId);
+    });
+    if (ports.length) await connect(ports[0]);
+  };
+  navigator.serial.addEventListener('connect', () => setTimeout(autoConnect, 500));
+  autoConnect();
+}
+</script>
+</body>
+</html>
