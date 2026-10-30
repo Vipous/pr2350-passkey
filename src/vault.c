@@ -370,33 +370,48 @@ const vault_entry_t *vault_get(int index) {
     return &entries[index];
 }
 
-// Adds an entry at its place by name, in RAM only. The caller checks there is room.
-static int insert_sorted(const vault_entry_t *e) {
-    vault_entry_t item = *e;
-    item.name[VAULT_NAME_LEN - 1] = 0;
-    item.login[VAULT_LOGIN_LEN - 1] = 0;
-    item.pass[VAULT_PASS_LEN - 1] = 0;
-    int pos = 0;
-    while (pos < count && strcasecmp(entries[pos].name, item.name) <= 0) pos++;
-    memmove(&entries[pos + 1], &entries[pos], (size_t)(count - pos) * sizeof(item));
-    entries[pos] = item;
-    count++;
-    secure_zero(&item, sizeof(item));
-    return pos;
+// Stores an entry at pos (an existing slot, or count to add one), in RAM only, with its strings
+// terminated. The caller checks there is room.
+static void store(int pos, const vault_entry_t *e) {
+    entries[pos] = *e;
+    entries[pos].name[VAULT_NAME_LEN - 1] = 0;
+    entries[pos].login[VAULT_LOGIN_LEN - 1] = 0;
+    entries[pos].pass[VAULT_PASS_LEN - 1] = 0;
+    if (pos == count) count++;
 }
 
 int vault_put(int index, const vault_entry_t *e) {
     if (!unlocked || index >= count) return -1;
     if (index < 0 && count >= VAULT_MAX_ENTRIES) return -1;
-
-    if (index >= 0) {
-        memmove(&entries[index], &entries[index + 1], (size_t)(count - index - 1) * sizeof(vault_entry_t));
-        count--;
-    }
-    int pos = insert_sorted(e);
-    secure_zero(&entries[count], (size_t)(VAULT_MAX_ENTRIES - count) * sizeof(vault_entry_t));
-
+    int pos = index < 0 ? count : index;
+    store(pos, e);
     return save() ? pos : -1;
+}
+
+bool vault_reorder(const uint8_t *order, int n) {
+    if (!unlocked || n != count) return false;
+    uint8_t seen[VAULT_MAX_ENTRIES] = {0};
+    for (int i = 0; i < n; i++) {
+        if (order[i] >= n || seen[order[i]]) return false;
+        seen[order[i]] = 1;
+    }
+    // In place, cycle by cycle, so no second copy of the passwords sits in RAM.
+    uint8_t done[VAULT_MAX_ENTRIES] = {0};
+    vault_entry_t tmp;
+    for (int i = 0; i < n; i++) {
+        if (done[i]) continue;
+        tmp = entries[i];
+        int j = i;
+        while (order[j] != i) {
+            entries[j] = entries[order[j]];
+            done[j] = 1;
+            j = order[j];
+        }
+        entries[j] = tmp;
+        done[j] = 1;
+    }
+    secure_zero(&tmp, sizeof(tmp));
+    return save();
 }
 
 bool vault_merge(const vault_entry_t *list, int n, bool replace, int *added, int *skipped) {
@@ -414,7 +429,7 @@ bool vault_merge(const vault_entry_t *list, int n, bool replace, int *added, int
             (*skipped)++;
             continue;
         }
-        insert_sorted(&list[i]);
+        store(count, &list[i]);
         (*added)++;
     }
     return save();

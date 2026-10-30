@@ -16,6 +16,7 @@
 #include "usb_kbd.h"
 #include "pass_vault.h"
 #include "pet.h"
+#include "settings.h"
 
 #define HOR_RES AMOLED_1IN8_WIDTH
 #define VER_RES AMOLED_1IN8_HEIGHT
@@ -64,9 +65,6 @@ static int main_screen = SCR_LIST;   // Passwords or Hotkeys, whichever was open
 static int menu_from;                // where the menu was opened, to go back on a second press
 static int settings_from;            // Settings goes back here: the cat or the main screen
 
-// How the cat screen opens the passwords: chosen in Settings, to try out which is handier.
-enum { OPEN_DOUBLE_TAP, OPEN_HOLD };
-static int open_gesture = OPEN_DOUBLE_TAP;
 
 // ---------------------------------------------------------------------------
 // Display and touch glue
@@ -548,12 +546,13 @@ static void lock_now(void) {
 
 // --- List ---
 
-static void row_cb(lv_event_t *e) {
-    show_detail((int)(intptr_t)lv_event_get_user_data(e));
+// A tap types the entry; holding opens its details (LVGL sends SHORT_CLICKED only without a hold).
+static void row_type_cb(lv_event_t *e) {
+    type_entry(vault_get((int)(intptr_t)lv_event_get_user_data(e)), TYPE_DEFAULT);
 }
 
-static void quick_type_cb(lv_event_t *e) {
-    type_entry(vault_get((int)(intptr_t)lv_event_get_user_data(e)), TYPE_DEFAULT);
+static void row_hold_cb(lv_event_t *e) {
+    show_detail((int)(intptr_t)lv_event_get_user_data(e));
 }
 
 static void list_scroll_cb(lv_event_t *e) {
@@ -566,38 +565,47 @@ static void show_list(void) {
     screen = main_screen = SCR_LIST;
     lv_obj_t *scr = new_screen();
 
+    // Two big rows per screen, snapping into place as the list scrolls: easy to hit without aiming.
+    const lv_coord_t top = 20, pad = 4, gap = 12;
+    const lv_coord_t list_h = VER_RES - 2 * top;
+    const lv_coord_t row_h = (list_h - 2 * pad - gap) / 2;
     lv_obj_t *list = lv_obj_create(scr);
-    lv_obj_set_size(list, HOR_RES - 2 * MARGIN + 8, VER_RES - TOP - 16);
-    lv_obj_set_pos(list, MARGIN - 4, TOP);
+    lv_obj_set_size(list, HOR_RES - 2 * MARGIN + 8, list_h);
+    lv_obj_set_pos(list, MARGIN - 4, top);
     lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(list, 0, 0);
-    lv_obj_set_style_pad_all(list, 4, 0);
-    lv_obj_set_style_pad_bottom(list, 30, 0);   // last row clear of the rounded corners
-    lv_obj_set_style_pad_row(list, 10, 0);
+    lv_obj_set_style_pad_all(list, pad, 0);
+    lv_obj_set_style_pad_row(list, gap, 0);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_scroll_snap_y(list, LV_SCROLL_SNAP_START);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
 
     int n = vault_count();
-    const lv_coord_t text_w = HOR_RES - 2 * MARGIN - 116;
+    const lv_coord_t text_w = HOR_RES - 2 * MARGIN - 40;
     for (int i = 0; i < n; i++) {
         const vault_entry_t *en = vault_get(i);
-        lv_obj_t *row = button(list, NULL, COLOR_CARD, lv_pct(100), 84, row_cb, (void *)(intptr_t)i);
-        lv_obj_set_style_pad_hor(row, 16, 0);
-        lv_obj_set_style_pad_ver(row, 10, 0);
+        lv_obj_t *row = button(list, NULL, COLOR_CARD, lv_pct(100), row_h, NULL, NULL);
+        lv_obj_add_event_cb(row, row_type_cb, LV_EVENT_SHORT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_add_event_cb(row, row_hold_cb, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)i);
+        lv_obj_set_style_radius(row, 22, 0);
+        lv_obj_set_style_pad_all(row, 20, 0);
+        lv_obj_set_style_bg_color(row, lv_color_hex(COLOR_ACCENT), LV_STATE_PRESSED);
 
-        lv_obj_t *name = label(row, en->name, &lv_font_montserrat_24, 0xFFFFFF);
-        lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(name, text_w);
-        lv_obj_align(name, en->login[0] ? LV_ALIGN_TOP_LEFT : LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_t *icon = label(row, LV_SYMBOL_KEYBOARD, &lv_font_montserrat_28, COLOR_MUTED);
+        lv_obj_align(icon, LV_ALIGN_TOP_RIGHT, 0, 0);
+
+        lv_obj_t *name = label(row, en->name, &lv_font_montserrat_28, 0xFFFFFF);
+        lv_label_set_long_mode(name, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(name, text_w - 20);
+        lv_obj_set_style_max_height(name, 2 * 34, 0);   // two lines at most
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, 0, en->login[0] ? -18 : 0);
         if (en->login[0]) {
-            lv_obj_t *login = label(row, en->login, &lv_font_montserrat_16, COLOR_MUTED);
+            lv_obj_t *login = label(row, en->login, &lv_font_montserrat_20, COLOR_MUTED);
             lv_label_set_long_mode(login, LV_LABEL_LONG_DOT);
             lv_obj_set_width(login, text_w);
             lv_obj_align(login, LV_ALIGN_BOTTOM_LEFT, 0, 0);
         }
-        // One tap types the entry; the rest of the row opens its details.
-        lv_obj_t *kb = button(row, LV_SYMBOL_KEYBOARD, COLOR_ACCENT, 80, 64, quick_type_cb, (void *)(intptr_t)i);
-        lv_obj_align(kb, LV_ALIGN_RIGHT_MID, 8, 0);
     }
     if (n == 0) {
         lv_obj_t *empty = label(list,
@@ -679,7 +687,6 @@ static void show_keys(void) {
 // --- Home: the cat ---
 
 static uint32_t last_tap;
-static bool held;
 
 static void home_hint_cb(lv_timer_t *t) {
     lv_obj_add_flag((lv_obj_t *)t->user_data, LV_OBJ_FLAG_HIDDEN);
@@ -688,17 +695,10 @@ static void home_hint_cb(lv_timer_t *t) {
 
 static void home_touch_cb(lv_event_t *e) {
     lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_PRESSED) {
-        held = false;
-    } else if (code == LV_EVENT_LONG_PRESSED) {
-        if (open_gesture == OPEN_HOLD) {
-            held = true;
-            show_main();
-        }
-    } else if (code == LV_EVENT_CLICKED && !held) {
-        // A tap strokes the cat; with the double-tap setting, a second one soon after opens the list.
+    if (code == LV_EVENT_CLICKED) {
+        // A tap is for the character; a second one soon after opens the list.
         uint32_t now = lv_tick_get();
-        if (open_gesture == OPEN_DOUBLE_TAP && last_tap && now - last_tap < 450) {
+        if (last_tap && now - last_tap < 450) {
             last_tap = 0;
             show_main();
             return;
@@ -711,15 +711,12 @@ static void home_touch_cb(lv_event_t *e) {
 static void show_home(void) {
     screen = SCR_HOME;
     lv_obj_t *scr = new_screen();
-    lv_obj_t *pet = pet_create(scr);
-    lv_obj_add_event_cb(pet, home_touch_cb, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(pet, home_touch_cb, LV_EVENT_LONG_PRESSED, NULL);
+    lv_obj_t *pet = pet_create(scr, (pet_character_t)settings_get()->character);
     lv_obj_add_event_cb(pet, home_touch_cb, LV_EVENT_CLICKED, NULL);
     last_tap = 0;
 
     // How to get to the passwords, for a few seconds after the screen appears.
-    lv_obj_t *hint = label(scr, open_gesture == OPEN_HOLD ? "Hold to open passwords" : "Double-tap to open passwords",
-                           &lv_font_montserrat_16, COLOR_MUTED);
+    lv_obj_t *hint = label(scr, "Double-tap to open passwords", &lv_font_montserrat_16, COLOR_MUTED);
     lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 34);
     lv_obj_clear_flag(hint, LV_OBJ_FLAG_CLICKABLE);
     screen_timer = lv_timer_create(home_hint_cb, 4000, hint);
@@ -747,7 +744,7 @@ static void show_menu(void) {
     lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 22);
 
     static const struct { const char *text; int target; } items[] = {
-        {LV_SYMBOL_HOME "   Cat", SCR_HOME},
+        {LV_SYMBOL_HOME "   Home", SCR_HOME},
         {LV_SYMBOL_LIST "   Passwords", SCR_LIST},
         {LV_SYMBOL_KEYBOARD "   Hotkeys", SCR_KEYS},
         {LV_SYMBOL_SETTINGS "   Settings", SCR_SETTINGS},
@@ -869,6 +866,11 @@ static void show_detail(int index) {
 static void brightness_cb(lv_event_t *e) {
     brightness = lv_slider_get_value(lv_event_get_target(e));
     AMOLED_1IN8_SetBrightness(brightness);
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) {   // saved once the finger lifts
+        settings_t st = *settings_get();
+        st.brightness = (uint8_t)brightness;
+        settings_save(&st);
+    }
 }
 
 static void lock_off_confirmed(bool yes) {
@@ -970,9 +972,12 @@ static lv_obj_t *segmented(lv_obj_t *scr, const char **map, int checked, lv_coor
     return bm;
 }
 
-static void open_gesture_cb(lv_event_t *e) {
+static void character_cb(lv_event_t *e) {
     uint16_t sel = lv_btnmatrix_get_selected_btn(lv_event_get_target(e));
-    if (sel != LV_BTNMATRIX_BTN_NONE) open_gesture = sel == 1 ? OPEN_HOLD : OPEN_DOUBLE_TAP;
+    if (sel == LV_BTNMATRIX_BTN_NONE) return;
+    settings_t st = *settings_get();
+    st.character = sel == 1 ? PET_CHAR_BOMB : PET_CHAR_CAT;
+    settings_save(&st);
 }
 
 static void show_settings(void) {
@@ -992,6 +997,7 @@ static void show_settings(void) {
     lv_slider_set_range(s, 10, 100);
     lv_slider_set_value(s, brightness, LV_ANIM_OFF);
     lv_obj_add_event_cb(s, brightness_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s, brightness_cb, LV_EVENT_RELEASED, NULL);
 
     l = label(scr, "PROTECTION", &lv_font_montserrat_14, COLOR_MUTED);
     lv_obj_set_pos(l, MARGIN, 150);
@@ -1012,11 +1018,11 @@ static void show_settings(void) {
     }
     y += 64;
 
-    l = label(scr, "OPEN PASSWORDS FROM THE CAT", &lv_font_montserrat_14, COLOR_MUTED);
+    l = label(scr, "HOME SCREEN", &lv_font_montserrat_14, COLOR_MUTED);
     lv_obj_set_pos(l, MARGIN, y);
-    static const char *open_map[] = {"Double-tap", "Hold", ""};
-    bm = segmented(scr, open_map, open_gesture, y + 22);
-    lv_obj_add_event_cb(bm, open_gesture_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    static const char *home_map[] = {"Cat", "Bomb", ""};
+    bm = segmented(scr, home_map, settings_get()->character == PET_CHAR_BOMB ? 1 : 0, y + 22);
+    lv_obj_add_event_cb(bm, character_cb, LV_EVENT_VALUE_CHANGED, NULL);
     y += 22 + 56 + 10;
 
     l = label(scr, "", &lv_font_montserrat_14, COLOR_MUTED);
@@ -1166,7 +1172,7 @@ void ui_init(void) {
     lv_indev_drv_init(&indev_drv);
     indev_drv.type = LV_INDEV_TYPE_POINTER;
     indev_drv.read_cb = touch_read_cb;
-    indev_drv.long_press_time = 700;   // "Hold" on the cat screen
+    indev_drv.long_press_time = 700;   // holding a password row opens it
     lv_indev_drv_register(&indev_drv);
 
     // The display DMA interrupt is serviced on this core, like everything else in the UI.
@@ -1185,6 +1191,9 @@ void ui_init(void) {
     lv_obj_add_flag(toast, LV_OBJ_FLAG_HIDDEN);
 
     hotkeys_init();
+    settings_init();
+    brightness = settings_get()->brightness;
+    AMOLED_1IN8_SetBrightness(brightness);
     buttons_init();   // AXP2101 on I2C1, next to touch
     vault_init();
     if (vault_is_unlocked()) show_home();

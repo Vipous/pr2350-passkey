@@ -72,6 +72,10 @@
   td .site { font-weight: 600; }
   td .sub { font-size: 13px; color: var(--muted); }
   td.num { white-space: nowrap; }
+  td.grip { width: 28px; color: var(--muted); cursor: grab; text-align: center; font-size: 18px; user-select: none; }
+  tr.dragging td { opacity: .4; }
+  tr.drop-before td { border-top: 2px solid var(--accent); }
+  tr.drop-after td { border-bottom: 2px solid var(--accent); }
   .empty { text-align: center; padding: 28px 0; color: var(--muted); }
   @media (max-width: 720px) {
     .grid { grid-template-columns: 1fr; }
@@ -133,10 +137,13 @@
       <div class="top" style="margin-bottom:12px">
         <h2 style="margin:0">Записи <span class="muted" id="count"></span></h2>
         <span class="spacer"></span>
+        <button id="sortAbcBtn" class="hidden" title="Расставить записи по названию">А→Я</button>
         <input type="search" id="search" placeholder="Поиск" style="max-width:220px">
       </div>
+      <p class="note hidden" id="orderNote" style="margin-top:-4px">В этом порядке записи идут на плате.
+        Перетащите строку за ⠿, чтобы поменять место.</p>
       <table>
-        <thead><tr><th style="width:20%">Название</th><th style="width:22%">Логин</th><th style="width:24%">Новый пароль</th><th>Ввод</th><th></th></tr></thead>
+        <thead><tr><th class="gripcol"></th><th style="width:20%">Название</th><th style="width:22%">Логин</th><th style="width:24%">Новый пароль</th><th>Ввод</th><th></th></tr></thead>
         <tbody id="rows"></tbody>
       </table>
       <div class="empty hidden" id="empty">Пока пусто. Добавьте запись выше или импортируйте CSV.</div>
@@ -256,6 +263,7 @@ const FLAG_ENTER = 1, FLAG_LOGIN = 2;
 const $ = id => document.getElementById(id);
 let entries = [];        // {index, name, login, flags, passLen}
 let maxEntries = 96;
+let protocol = 0;        // editor protocol of the firmware; ORDER needs 6
 
 // ---------------------------------------------------------------- serial
 
@@ -356,6 +364,7 @@ let lockPoll = null;
 async function hello(timeoutMs = 3000) {
   const parts = (await dev.cmd(['HELLO'], timeoutMs)).reply.split(' ');
   if (parts[0] !== 'PassKey') throw new Error('это не Pass Key');
+  protocol = parseInt(parts[1], 10) || 0;
   maxEntries = parseInt(parts[2], 10) || maxEntries;
   const info = { locked: parts[3] === 'locked', mode: parts[4] || 'none' };
   $('statusText').textContent = 'Подключено · ' + (MODE_NAMES[info.mode] || info.mode);
@@ -409,7 +418,12 @@ function render() {
   const tbody = $('rows');
   tbody.textContent = '';
   const shown = entries.filter(e => !q || e.name.toLowerCase().includes(q) || e.login.toLowerCase().includes(q));
-  for (const e of shown) tbody.appendChild(renderRow(e));
+  // Reordering works on the whole list: not while a search hides part of it.
+  const canOrder = protocol >= 6 && !q && entries.length > 1;
+  for (const e of shown) tbody.appendChild(renderRow(e, canOrder));
+  $('sortAbcBtn').classList.toggle('hidden', !(protocol >= 6 && entries.length > 1));
+  $('orderNote').classList.toggle('hidden', !canOrder);
+  document.querySelector('th.gripcol').classList.toggle('hidden', protocol < 6);
   $('count').textContent = `${entries.length} из ${maxEntries}`;
   $('empty').classList.toggle('hidden', entries.length > 0);
 }
@@ -423,8 +437,57 @@ function el(tag, props = {}, children = []) {
   return n;
 }
 
-function renderRow(e) {
+// Sends the new order: a list of current indices. The board saves it in one go.
+async function sendOrder(order) {
+  if (order.every((v, i) => v === i)) return;
+  await dev.cmd(['ORDER', order.join(',')]);
+  await refresh();
+}
+
+let dragFrom = null;   // index in entries of the row being dragged
+
+function renderRow(e, canOrder) {
   const tr = el('tr');
+  const grip = el('td', { className: 'grip', textContent: canOrder ? '⠿' : '', title: canOrder ? 'Перетащите, чтобы поменять порядок' : '' });
+  if (protocol < 6) grip.classList.add('hidden');
+  if (canOrder) {
+    // Only the grip starts a drag, so text in the inputs can still be selected.
+    grip.onmousedown = () => { tr.draggable = true; };
+    tr.addEventListener('dragstart', ev => {
+      dragFrom = entries.indexOf(e);
+      tr.classList.add('dragging');
+      ev.dataTransfer.effectAllowed = 'move';
+      ev.dataTransfer.setData('text/plain', String(e.index));
+    });
+    tr.addEventListener('dragend', () => {
+      tr.draggable = false;
+      tr.classList.remove('dragging');
+      document.querySelectorAll('.drop-before, .drop-after').forEach(r => r.classList.remove('drop-before', 'drop-after'));
+    });
+    tr.addEventListener('dragover', ev => {
+      if (dragFrom === null) return;
+      ev.preventDefault();
+      const r = tr.getBoundingClientRect();
+      const after = ev.clientY > r.top + r.height / 2;
+      tr.classList.toggle('drop-after', after);
+      tr.classList.toggle('drop-before', !after);
+    });
+    tr.addEventListener('dragleave', () => tr.classList.remove('drop-before', 'drop-after'));
+    tr.addEventListener('drop', ev => {
+      ev.preventDefault();
+      const after = tr.classList.contains('drop-after');
+      tr.classList.remove('drop-before', 'drop-after');
+      const from = dragFrom;
+      dragFrom = null;
+      if (from === null) return;
+      const list = entries.map(x => x.index);
+      const [moved] = list.splice(from, 1);
+      let to = entries.indexOf(e) + (after ? 1 : 0);
+      if (from < to) to--;
+      list.splice(to, 0, moved);
+      busy($('sortAbcBtn'), async () => { await sendOrder(list); toast('Порядок сохранён'); });
+    });
+  }
   const name = el('input', { type: 'text', value: e.name, maxLength: LIMITS.name });
   const login = el('input', { type: 'text', value: e.login, maxLength: LIMITS.login, autocomplete: 'off' });
   const pass = el('input', { type: 'password', maxLength: LIMITS.pass, autocomplete: 'new-password',
@@ -458,6 +521,7 @@ function renderRow(e) {
   });
 
   tr.append(
+    grip,
     el('td', {}, [name]),
     el('td', {}, [login]),
     el('td', {}, [el('div', { className: 'passrow' }, [pass, gen])]),
@@ -604,6 +668,12 @@ $('importBtn').onclick = () => busy($('importBtn'), async () => {
 $('newShow').onclick = () => { const p = $('newPass'); p.type = p.type === 'password' ? 'text' : 'password'; };
 $('newGen').onclick = () => { $('newPass').value = generate(); $('newPass').type = 'text'; };
 $('search').oninput = render;
+$('sortAbcBtn').onclick = () => busy($('sortAbcBtn'), async () => {
+  if (!confirm('Расставить все записи по названию, от А до Я?')) return;
+  const sorted = [...entries].sort((a, b) => a.name.localeCompare(b.name, 'ru', { sensitivity: 'base' }));
+  await sendOrder(sorted.map(x => x.index));
+  toast('Записи расставлены по названию');
+});
 
 $('addBtn').onclick = () => busy($('addBtn'), async () => {
   const name = $('newName').value.trim(), login = $('newLogin').value, pass = $('newPass').value;

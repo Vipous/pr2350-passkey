@@ -7,6 +7,7 @@
 
 #define TICK_MS 150
 #define CAT_SCALE 10   // screen pixels per sprite pixel
+#define BOMB_SCALE 8
 
 // The scene: the cat, one prop (yarn or bowl) and a few floating particles (hearts, Zs).
 typedef struct {
@@ -17,7 +18,7 @@ typedef struct {
 
 enum { IT_CAT, IT_PROP, IT_P0, IT_COUNT = IT_P0 + 4 };
 
-typedef enum { A_IDLE, A_WALK, A_GROOM, A_PLAY, A_EAT, A_MEOW, A_SLEEP, A_HAPPY } act_t;
+typedef enum { A_IDLE, A_WALK, A_GROOM, A_PLAY, A_EAT, A_MEOW, A_SLEEP, A_HAPPY, A_PANIC, A_POOF } act_t;
 
 static lv_obj_t *obj;
 static lv_timer_t *timer;
@@ -25,6 +26,7 @@ static item_t items[IT_COUNT], drawn[IT_COUNT];
 static int part_life[IT_COUNT];
 static lv_coord_t scr_w, scr_h, floor_y;
 
+static pet_character_t chr;
 static act_t act;
 static int act_left;     // ticks left in the activity; -1 = until told otherwise
 static uint32_t tick;
@@ -103,8 +105,9 @@ static void draw_cb(lv_event_t *e) {
 // ---------------------------------------------------------------------------
 // Behaviour
 
-static int cat_w(void) { return sprite_w(PET_SIT_A, CAT_SCALE); }
-static int cat_y(int sprite) { return floor_y - sprite_h(sprite, CAT_SCALE); }
+static int char_scale(void) { return chr == PET_CHAR_BOMB ? BOMB_SCALE : CAT_SCALE; }
+static int cat_w(void) { return sprite_w(chr == PET_CHAR_BOMB ? PET_BOMB_STAND : PET_SIT_A, char_scale()); }
+static int cat_y(int sprite) { return floor_y - sprite_h(sprite, char_scale()); }
 
 static void spawn(int sprite, int x, int y, int scale, int life) {
     for (int i = IT_P0; i < IT_COUNT; i++) {
@@ -137,6 +140,11 @@ static void start(act_t a, int ticks) {
 
 static void pick_next(void) {
     int r = rnd(100);
+    if (chr == PET_CHAR_BOMB) {   // the bomb mostly strolls about
+        if (r < 55) start(A_WALK, -1);
+        else start(A_IDLE, 15 + rnd(40));
+        return;
+    }
     if (r < 30) start(A_WALK, -1);
     else if (r < 45) start(A_GROOM, 18 + rnd(12));
     else if (r < 60) start(A_PLAY, 30 + rnd(20));
@@ -146,8 +154,55 @@ static void pick_next(void) {
     else start(A_IDLE, 20 + rnd(40));
 }
 
+// The bomb: walks around with its fuse fizzing; touched, it panics, then goes off with a puff.
+static void step_bomb(void) {
+    int frame = PET_BOMB_STAND, x_off = 0, y_off = 0;
+    bool spark = true, wild = false;
+    switch (act) {
+    case A_WALK: {
+        int d = target_x - cat_x;
+        cat_x += d > 0 ? (d < 6 ? d : 6) : (d > -6 ? d : -6);
+        frame = (tick / 2) % 2 ? PET_BOMB_WALK_B : PET_BOMB_WALK_A;
+        y_off = (tick % 2) ? -6 : 0;
+        if (cat_x == target_x) start(A_IDLE, 15 + rnd(30));
+        break;
+    }
+    case A_PANIC:
+        frame = tick % 2 ? PET_BOMB_PANIC_B : PET_BOMB_PANIC;
+        x_off = tick % 2 ? 6 : -6;   // shaking
+        wild = true;
+        break;
+    case A_POOF:
+        frame = PET_BOMB_SOOT;
+        spark = false;
+        break;
+    case A_SLEEP:
+        frame = PET_BOMB_BLINK;
+        spark = false;
+        if (tick % 9 == 0) spawn(PET_ZED, cat_x + cat_w() - 60 + rnd(20), cat_y(frame) + 40, 4, 14);
+        break;
+    default:
+        if (tick % 29 == 0 || tick % 41 == 0) frame = PET_BOMB_BLINK;
+        break;
+    }
+    int x = cat_x + x_off, y = cat_y(frame) + y_off;
+    set_item(IT_CAT, frame, x, y, BOMB_SCALE);
+    if (spark) {
+        // On the wick's tip (sprite pixel 19, 1); bigger and wilder in a panic.
+        int sc = wild ? 8 : 5, half = sprite_w(PET_SPARK_A, sc) / 2;
+        int sp = wild ? (tick % 2 ? PET_SPARK_A : PET_SPARK_B) : ((tick / 2) % 2 ? PET_SPARK_A : PET_SPARK_B);
+        set_item(IT_PROP, sp, x + 19 * BOMB_SCALE + BOMB_SCALE / 2 - half, y + BOMB_SCALE + BOMB_SCALE / 2 - half, sc);
+    } else {
+        items[IT_PROP].sprite = -1;
+    }
+}
+
 static void step(void) {
     tick++;
+    if (chr == PET_CHAR_BOMB) {
+        step_bomb();
+        goto common;
+    }
     int frame = PET_SIT_A, y_off = 0;
 
     switch (act) {
@@ -195,21 +250,33 @@ static void step(void) {
         frame = PET_SIT_HAPPY;
         if (tick % 3 == 0) spawn(PET_HEART, cat_x + 40 + rnd(cat_w() - 100), cat_y(PET_SIT_A) + 20, 4, 10);
         break;
+    default:   // the bomb's own states
+        break;
     }
 
     set_item(IT_CAT, frame, cat_x, cat_y(frame) + y_off, CAT_SCALE);
 
+common:
     // Particles drift up and fade out.
     for (int i = IT_P0; i < IT_COUNT; i++) {
         if (items[i].sprite < 0) continue;
-        items[i].y -= items[i].sprite == PET_ZED ? 5 : 8;
-        items[i].x += items[i].sprite == PET_ZED ? 3 : (rnd(3) - 1) * 3;
+        int sp = items[i].sprite;
+        items[i].y -= sp == PET_ZED ? 5 : sp == PET_SMOKE ? 4 : 8;
+        items[i].x += sp == PET_ZED ? 3 : (rnd(3) - 1) * 3;
         if (--part_life[i] <= 0 || items[i].y < 0) items[i].sprite = -1;
     }
 
     if (act_left > 0 && --act_left == 0) {
-        if (act == A_SLEEP || act == A_HAPPY || act == A_EAT) start(A_IDLE, 20 + rnd(30));
-        else pick_next();
+        if (act == A_PANIC) {
+            // Boom (a small one): smoke from the wick, a sooty face for a moment.
+            start(A_POOF, 14);
+            for (int k = 0; k < 3; k++)
+                spawn(PET_SMOKE, cat_x + 19 * BOMB_SCALE - 40 + rnd(60), cat_y(PET_BOMB_SOOT) - 10 + rnd(30), 8, 12);
+        } else if (act == A_SLEEP || act == A_HAPPY || act == A_EAT || act == A_POOF) {
+            start(A_IDLE, 20 + rnd(30));
+        } else {
+            pick_next();
+        }
     }
     if (act == A_IDLE && act_left < 0) start(A_IDLE, 20 + rnd(30));
 }
@@ -227,7 +294,8 @@ static void delete_cb(lv_event_t *e) {
     obj = NULL;
 }
 
-lv_obj_t *pet_create(lv_obj_t *parent) {
+lv_obj_t *pet_create(lv_obj_t *parent, pet_character_t character) {
+    chr = character;
     obj = lv_obj_create(parent);
     scr_w = lv_obj_get_width(parent);
     scr_h = lv_obj_get_height(parent);
@@ -246,6 +314,7 @@ lv_obj_t *pet_create(lv_obj_t *parent) {
     for (int i = 0; i < IT_COUNT; i++) items[i].sprite = drawn[i].sprite = -1;
     if (cat_x <= 0 || cat_x > scr_w - cat_w()) cat_x = (scr_w - cat_w()) / 2;
     if (sleepy) start(A_SLEEP, -1);
+    else if (chr == PET_CHAR_BOMB) start(A_WALK, -1);
     else start(A_MEOW, 6);   // says hello
     step();
     commit();
@@ -255,6 +324,10 @@ lv_obj_t *pet_create(lv_obj_t *parent) {
 
 void pet_stroke(void) {
     if (!obj) return;
+    if (chr == PET_CHAR_BOMB) {
+        if (act != A_PANIC && act != A_POOF) start(A_PANIC, 18);   // about to blow!
+        return;
+    }
     for (int i = IT_P0; i < IT_COUNT; i++) items[i].sprite = -1;
     if (act == A_SLEEP) start(A_MEOW, 8);   // woken up
     else start(A_HAPPY, 14);
@@ -265,5 +338,5 @@ void pet_set_sleepy(bool s) {
     sleepy = s;
     if (!obj) return;
     if (s) start(A_SLEEP, -1);
-    else if (act == A_SLEEP) start(A_MEOW, 8);
+    else if (act == A_SLEEP) start(chr == PET_CHAR_BOMB ? A_IDLE : A_MEOW, 8);
 }

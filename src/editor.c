@@ -13,14 +13,14 @@
 #include "tusb.h"
 #include "pass_vault.h"
 
-#define PROTOCOL_VERSION 5
+#define PROTOCOL_VERSION 6
 #define LINE_MAX 320
 #define MAX_FIELDS 6
 
 // ---------------------------------------------------------------------------
 // Mailbox between the cores: core 0 posts, core 1 runs it against the vault and marks it done.
 
-typedef enum { OP_GET, OP_PUT, OP_DEL, OP_WIPE, OP_BACKUP, OP_RESTORE, OP_KEYS_GET, OP_KEYS_SET, OP_KEYS_RESET } op_t;
+typedef enum { OP_GET, OP_PUT, OP_DEL, OP_WIPE, OP_BACKUP, OP_RESTORE, OP_KEYS_GET, OP_KEYS_SET, OP_KEYS_RESET, OP_ORDER } op_t;
 enum { REQ_IDLE, REQ_POSTED, REQ_DONE };
 
 static struct {
@@ -41,6 +41,10 @@ static void post(op_t op, int index) {
     __dmb();
     req.state = REQ_POSTED;
 }
+
+// New order of the entries for ORDER, filled by core 0 before the request.
+static uint8_t order_buf[VAULT_MAX_ENTRIES];
+static int order_n;
 
 static volatile bool locked;
 static volatile uint8_t lock_mode;
@@ -159,6 +163,14 @@ editor_activity_t editor_service(void) {
         break;
     case OP_KEYS_RESET:
         req.result = hotkeys_reset() ? 1 : -1;
+        changed = true;
+        break;
+    case OP_ORDER:
+        if (order_n != vault_count()) {
+            req.result = -5;
+            break;
+        }
+        req.result = vault_reorder(order_buf, order_n) ? 1 : -1;
         changed = true;
         break;
     }
@@ -348,6 +360,28 @@ static void handle_line(char *s) {
             waiting_op = OP_DEL;
             post(OP_DEL, idx);
         }
+    } else if (strcmp(cmd, "ORDER") == 0) {
+        // ORDER <i0>,<i1>,...: current indices of the entries in their new order, all of them.
+        order_n = 0;
+        const char *p = n > 1 ? f[1] : "";
+        while (*p && !err) {
+            char *end;
+            long v = strtol(p, &end, 10);
+            if (end == p || v < 0 || v >= VAULT_MAX_ENTRIES || order_n >= VAULT_MAX_ENTRIES) err = "bad order";
+            else order_buf[order_n++] = (uint8_t)v;
+            p = *end == ',' ? end + 1 : end;
+            if (*end && *end != ',') err = "bad order";
+        }
+        if (!err && order_n == 0) err = "bad order";
+        uint8_t seen[VAULT_MAX_ENTRIES] = {0};   // each index once
+        for (int i = 0; i < order_n && !err; i++) {
+            if (order_buf[i] >= order_n || seen[order_buf[i]]) err = "bad order";
+            else seen[order_buf[i]] = 1;
+        }
+        if (!err) {
+            waiting_op = OP_ORDER;
+            post(OP_ORDER, 0);
+        }
     } else if (strcmp(cmd, "WIPE") == 0) {
         waiting_op = OP_WIPE;
         post(OP_WIPE, 0);
@@ -493,7 +527,8 @@ void editor_task(void) {
         }
         if (state == ST_WAIT) {
             if (waiting_op == OP_RESTORE && req.result < 0) restore_state = RS_FAILED;
-            if (req.result == -4) reply("ERR not a Pass Key backup\n");
+            if (req.result == -5) reply("ERR list changed, reload it\n");
+            else if (req.result == -4) reply("ERR not a Pass Key backup\n");
             else if (req.result == -3) reply("ERR locked\n");
             else if (req.result == -2) reply("ERR no such entry\n");
             else if (req.result < 0) reply("ERR %s\n", waiting_op == OP_PUT && req.count >= VAULT_MAX_ENTRIES ? "list is full" : "flash write failed");

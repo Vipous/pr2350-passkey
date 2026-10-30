@@ -47,14 +47,17 @@ bool vault_wipe(void);   // erases entries and protection
 
 int vault_count(void);
 const vault_entry_t *vault_get(int index);
-// Adds (index < 0) or replaces an entry and saves. Entries stay sorted by name;
-// returns the entry's new index, or -1 if it could not be saved.
+// Adds (index < 0, at the end) or replaces an entry in place, and saves. Returns the entry's
+// index, or -1 if it could not be saved.
 int vault_put(int index, const vault_entry_t *entry);
 bool vault_delete(int index);
+// Puts the entries in a new order and saves: order[i] is the current index of the entry that
+// becomes number i. It must list every entry once.
+bool vault_reorder(const uint8_t *order, int n);
 
 // Adds entries from a backup in one save; with replace, the current list is dropped first.
 // Entries with the same name and login as an existing one are skipped, as are those that
-// don't fit.
+// don't fit. New ones go at the end.
 bool vault_merge(const vault_entry_t *list, int n, bool replace, int *added, int *skipped);
 
 // Code for backup files, 24 digits. Made (and saved) the first time it's asked for; stored
